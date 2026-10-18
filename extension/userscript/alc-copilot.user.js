@@ -266,6 +266,69 @@
   font-size: 14px;
 }
 
+.alc-chat-notice {
+  text-align: center;
+  color: var(--alc-text-muted);
+  padding: 12px 16px;
+  font-size: 12px;
+  border: 1px dashed var(--alc-border);
+  border-radius: 8px;
+  background: rgba(59,130,246,0.05);
+  margin: 8px 0;
+}
+
+/* Capture source banner, preview toggle and captured-text preview (Spec A) */
+.alc-capture {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  color: var(--alc-text-muted);
+  margin-bottom: 8px;
+  padding: 4px 8px;
+  border: 1px dashed var(--alc-border);
+  border-radius: 6px;
+  background: rgba(59,130,246,0.06);
+}
+
+.alc-capture strong { color: var(--alc-primary); }
+
+.alc-capture-toggle {
+  display: flex;
+  justify-content: flex-end;
+  margin-bottom: 6px;
+}
+
+.alc-capture-toggle label {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  color: var(--alc-text-muted);
+  cursor: pointer;
+  user-select: none;
+}
+
+.alc-capture-toggle input {
+  accent-color: var(--alc-primary);
+  margin: 0;
+}
+
+.alc-capture-preview {
+  margin: 8px 0 0;
+  padding: 8px 10px;
+  border-radius: 6px;
+  background: rgba(0,0,0,0.25);
+  border: 1px solid var(--alc-border);
+  font-size: 11px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  color: var(--alc-text-muted);
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 160px;
+  overflow-y: auto;
+}
+
 .alc-footer-text {
   font-size: 10px;
   text-align: center;
@@ -372,6 +435,34 @@
 
 const API_BASE = 'http://localhost:8000';
 
+// --- capture limits (Spec A / patch 2) ---
+const MAX_QUESTION_CHARS = 2000;
+const MAX_CONTEXT_CHARS = 4000;
+const MAX_VISIBLE_CHARS = 3000;
+const MAX_PAGE_CHARS = 12000;
+// Full cleaned page text for mcq-explain when no options were detected.
+// Must match EXTENSION_MAX_CONTEXT in backend/app/api/routes/extension.py.
+const MAX_PAGE_CONTEXT_CHARS = 60000;
+const SELECTION_MIN_CHARS = 10;
+const SELECTION_TTL_MS = 2 * 60 * 1000;
+const WATCH_DEBOUNCE_MS = 1500;
+// A constantly-mutating page must not postpone the check forever.
+const WATCH_MAX_DELAY_MS = 4000;
+
+const SKIP_SELECTOR = 'nav, header, footer, aside, [role="navigation"], [role="banner"]';
+const SKIP_TAGS = new Set(['SCRIPT', 'STYLE', 'NOSCRIPT', 'TEMPLATE', 'NAV', 'HEADER', 'FOOTER', 'ASIDE']);
+
+// The widget lives in the top frame only; other frames just answer questions
+// about their own content.
+const IS_TOP_FRAME = (() => {
+  try { return window.top === window.self; } catch (e) { return false; }
+})();
+
+const BRIDGE_REQUEST = 'ALC_QUESTION_REQUEST';
+const BRIDGE_RESPONSE = 'ALC_QUESTION_RESPONSE';
+const BRIDGE_TIMEOUT_MS = 400;
+let bridgeSeq = 0;
+
 const html = `
 <div id="alc-widget">
   <div id="alc-panel">
@@ -390,6 +481,11 @@ const html = `
           Select text on the page or use tools below.
         </div>
         <div id="alc-content"></div>
+        <div class="alc-capture-toggle">
+          <label title="Show the exact text sent to the AI">
+            <input type="checkbox" id="alc-preview-toggle"> Preview captured text
+          </label>
+        </div>
         <div class="alc-section">
           <div class="alc-section-title">Tools</div>
           <div class="alc-tools">
@@ -431,8 +527,12 @@ const html = `
 let chatHistory = [];
 let chatInitialized = false;
 let lastUrl = location.href;
-let lastPageHash = '';
 let mutationTimer = null;
+let lastSelection = { text: '', ts: 0 };
+let lastQuestionSignature = '';
+let previewCapture = false;
+let lastCapture = null;
+let watchFirstMutationAt = 0;
 
 function injectWidget() {
   if (document.getElementById('alc-widget')) return;
@@ -467,20 +567,498 @@ function injectWidget() {
   enableResize();
   enableDrag();
   startPageWatcher();
+
+  const previewToggle = document.getElementById('alc-preview-toggle');
+  try { previewCapture = localStorage.getItem('alc_preview') === '1'; } catch (e) { /* ignore */ }
+  if (previewToggle) {
+    previewToggle.checked = previewCapture;
+    previewToggle.onchange = () => {
+      previewCapture = previewToggle.checked;
+      try { localStorage.setItem('alc_preview', previewCapture ? '1' : '0'); } catch (e) { /* ignore */ }
+      if (previewCapture) showCapturePreview();
+    };
+  }
+
+  // Track the last real selection: clicking a panel button collapses it.
+  ['mouseup', 'keyup', 'selectionchange'].forEach(evt =>
+    document.addEventListener(evt, rememberSelection, true)
+  );
 }
 
-function getPageText() {
+// --- capture: shared helpers ---------------------------------------------
+
+function isInWidget(el) {
+  if (!el) return false;
+  if (el.id === 'alc-widget') return true;
+  const node = el.nodeType === 1 ? el : el.parentElement;
+  return !!(node && node.closest && node.closest('#alc-widget'));
+}
+
+function stripOptionMarker(text) {
+  return (text || '')
+    .trim()
+    .replace(/^\(?([A-Za-z]|\d{1,2})[.):]\s*/, '')
+    .trim();
+}
+
+function cssEscape(value) {
+  if (window.CSS && CSS.escape) return CSS.escape(value);
+  return String(value).replace(/([^\w-])/g, '\\$1');
+}
+
+// --- capture: rendered text ----------------------------------------------
+
+// An element the browser actually lays out: not inside the widget, not page
+// chrome, not display:none / visibility:hidden anywhere up the chain.
+function isRendered(el) {
+  if (!el || el.nodeType !== 1) return false;
+  if (SKIP_TAGS.has(el.tagName)) return false;
+  if (isInWidget(el)) return false;
+  if (el.closest && el.closest(SKIP_SELECTOR)) return false;
+  if (!el.getClientRects().length) return false;
+  const style = window.getComputedStyle(el);
+  return style.display !== 'none' && style.visibility !== 'hidden';
+}
+
+// Walk the LIVE dom collecting text from rendered nodes only. A detached
+// clone cannot do this: its innerText falls back to textContent, which drags
+// display:none content (hidden answers, widget text) into the prompt.
+function collectText(root, { limit = 0, accept } = {}) {
+  if (!root) return '';
   const parts = [];
+  let total = 0;
+  const cache = new Map();
+
+  const usable = (el) => {
+    if (cache.has(el)) return cache.get(el);
+    let ok = isRendered(el);
+    if (ok && accept) ok = accept(el);
+    cache.set(el, ok);
+    return ok;
+  };
+
+  const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
+    acceptNode(node) {
+      const parent = node.parentElement;
+      if (!parent || !usable(parent)) return NodeFilter.FILTER_REJECT;
+      return (node.nodeValue || '').trim() ? NodeFilter.FILTER_ACCEPT : NodeFilter.FILTER_REJECT;
+    },
+  });
+
+  let node;
+  while ((node = walker.nextNode())) {
+    const text = (node.nodeValue || '').trim();
+    if (!text) continue;
+    parts.push(text);
+    total += text.length + 1;
+    if (limit && total >= limit) break;
+  }
+  return parts.join(' ');
+}
+
+function renderedText(root, limit = 0) {
+  return collectText(root, { limit });
+}
+
+function inViewport(el) {
+  const rect = el.getBoundingClientRect();
+  if (rect.width <= 0 || rect.height <= 0) return false;
+  return rect.bottom > 0 && rect.top < window.innerHeight
+    && rect.right > 0 && rect.left < window.innerWidth;
+}
+
+// --- capture: selection --------------------------------------------------
+
+function selectionRange() {
   try {
-    const main = document.querySelector('main') || document.querySelector('#root') || document.body;
-    parts.push(main.innerText || '');
+    const sel = window.getSelection();
+    if (!sel || !sel.rangeCount) return null;
+    return sel.getRangeAt(0);
+  } catch (e) {
+    return null;
+  }
+}
+
+// A selection that touches the widget is our own UI text, not page content.
+function selectionTouchesWidget(range) {
+  if (!range) return false;
+  const widget = document.getElementById('alc-widget');
+  if (!widget) return false;
+  try {
+    if (typeof range.intersectsNode === 'function' && range.intersectsNode(widget)) return true;
   } catch (e) { /* ignore */ }
-  document.querySelectorAll('iframe').forEach(f => {
+  return isInWidget(range.commonAncestorContainer)
+    || isInWidget(range.startContainer)
+    || isInWidget(range.endContainer);
+}
+
+function rememberSelection() {
+  const range = selectionRange();
+  if (!range) return;
+  const text = String(range).trim();
+  if (!text || selectionTouchesWidget(range)) return;
+  lastSelection = { text, ts: Date.now() };
+}
+
+function currentSelection() {
+  const range = selectionRange();
+  if (range && !selectionTouchesWidget(range)) {
+    const text = String(range).trim();
+    if (text.length >= SELECTION_MIN_CHARS) return text;
+  }
+  // Button clicks steal focus and collapse the selection, so fall back to the
+  // most recent non-widget selection if it's still fresh.
+  if (Date.now() - lastSelection.ts < SELECTION_TTL_MS) return lastSelection.text;
+  return '';
+}
+
+// --- capture: MCQ detection ----------------------------------------------
+
+function collectOptionGroups(root) {
+  const groups = [];
+
+  const usable = (el) => !isInWidget(el);
+
+  const byName = new Map();
+  root.querySelectorAll('input[type="radio"], input[type="checkbox"]').forEach(el => {
+    if (!usable(el)) return;
+    const name = el.getAttribute('name');
+    if (!name) return;
+    const key = `${el.type}|${name}`;
+    if (!byName.has(key)) byName.set(key, []);
+    byName.get(key).push(el);
+  });
+  byName.forEach(els => { if (els.length >= 2) groups.push(els); });
+
+  root.querySelectorAll('[role="radiogroup"]').forEach(rg => {
+    if (!usable(rg)) return;
+    const opts = Array.from(rg.querySelectorAll('[role="radio"]')).filter(usable);
+    if (opts.length >= 2) groups.push(opts);
+  });
+
+  root.querySelectorAll('[class]').forEach(el => {
+    if (!usable(el)) return;
+    const cls = (el.className || '').toString();
+    if (!/option|choice|answer/i.test(cls)) return;
+    const parent = el.parentElement;
+    if (!parent || isInWidget(parent)) return;
+    const siblings = Array.from(parent.children).filter(s =>
+      usable(s) && /option|choice|answer/i.test((s.className || '').toString())
+    );
+    if (siblings.length >= 2 && siblings.length <= 6) groups.push(siblings);
+  });
+
+  // Drop groups detected twice (same elements, e.g. class + role heuristics).
+  const seen = new Set();
+  return groups.filter(g => {
+    const sig = g.map(e => {
+      if (!e.__alcUid) e.__alcUid = Math.random().toString(36).slice(2);
+      return e.__alcUid;
+    }).sort().join(',');
+    if (seen.has(sig)) return false;
+    seen.add(sig);
+    return true;
+  });
+}
+
+// Custom-styled radios usually hide the <input> and paint a wrapper label, so
+// visibility, distance and text all come from the visible wrapper. Grouping
+// still uses the native input identity.
+function optionDisplayElement(el) {
+  if (!el) return null;
+  if (el.tagName === 'INPUT') {
+    if (el.id) {
+      const lbl = document.querySelector(`label[for="${cssEscape(el.id)}"]`);
+      if (lbl) return lbl;
+    }
+    const wrap = el.closest('label');
+    if (wrap) return wrap;
+    return el.parentElement || el;
+  }
+  return el;
+}
+
+// Only options whose visible wrapper is actually rendered, so display:none
+// text is never used just because an ancestor happens to have a box.
+function renderedOptions(els) {
+  return els.filter(el => {
+    const display = optionDisplayElement(el);
+    return !!display && isRendered(display);
+  });
+}
+
+function groupVisibility(els) {
+  const rects = els.map(el => (optionDisplayElement(el) || el).getBoundingClientRect());
+  const onscreen = rects.filter(r =>
+    r.width > 0 && r.height > 0 &&
+    r.bottom > 0 && r.top < window.innerHeight &&
+    r.right > 0 && r.left < window.innerWidth
+  );
+  if (!onscreen.length) return null;
+  const centre = onscreen.reduce((a, r) => a + r.top + r.height / 2, 0) / onscreen.length;
+  return {
+    fullyVisible: onscreen.length === rects.length,
+    distance: Math.abs(centre - window.innerHeight / 2),
+  };
+}
+
+function textBlockBefore(node, boundary) {
+  let cur = node;
+  while (cur && cur !== boundary) {
+    let sib = cur.previousElementSibling;
+    while (sib) {
+      const text = renderedText(sib, 0);
+      if (text) return text;
+      sib = sib.previousElementSibling;
+    }
+    cur = cur.parentElement;
+  }
+  return '';
+}
+
+function optionTextFor(el) {
+  const display = optionDisplayElement(el);
+  if (!display) return '';
+  return stripOptionMarker(renderedText(display, 0));
+}
+
+function detectMCQGroup() {
+  const groups = collectOptionGroups(document);
+  let best = null;
+
+  for (const els of groups) {
+    const shown = renderedOptions(els);
+    if (shown.length < 2) continue;
+    const vis = groupVisibility(shown);
+    if (!vis) continue;
+    const score = (vis.fullyVisible ? 0 : 1e6) + vis.distance;
+    if (!best || score < best.score) best = { els: shown, score };
+  }
+  if (!best) return null;
+
+  // Smallest ancestor holding the whole group plus one preceding text block.
+  const first = best.els[0];
+  let container = null;
+  let stem = '';
+  let cur = first;
+  while (cur && cur !== document.body) {
+    cur = cur.parentElement;
+    if (!cur) break;
+    if (!best.els.every(e => cur.contains(e))) continue;
+    const before = textBlockBefore(first, cur);
+    if (before) { container = cur; stem = before; break; }
+    if (container === null) container = cur; // fallback: group-only ancestor
+  }
+  if (!container || isInWidget(container)) return null;
+
+  const options = best.els.map(optionTextFor).filter(t => t.length > 0);
+  if (options.length < 2) return null;
+
+  const firstDisplay = optionDisplayElement(best.els[0]) || best.els[0];
+  if (!inViewport(firstDisplay)) return null;
+
+  return {
+    // Clean the ancestor: its raw innerText could include hidden nodes or
+    // widget text if the widget ever ends up nested inside it.
+    questionText: renderedText(container, 0),
+    stem,
+    options,
+  };
+}
+
+// --- capture: visible text -----------------------------------------------
+
+function viewportText(limit = MAX_VISIBLE_CHARS) {
+  return collectText(document.body || document.documentElement, {
+    limit,
+    accept: inViewport,
+  });
+}
+
+function nearestHeading() {
+  const headings = Array.from(document.querySelectorAll('h1, h2, h3'));
+  for (const heading of headings) {
+    if (isInWidget(heading)) continue;
+    if (heading.getBoundingClientRect().bottom <= 0) continue;
+    const text = renderedText(heading, 200);
+    if (text) return text;
+  }
+  return '';
+}
+
+function fullPageContext() {
+  return getPageText(MAX_PAGE_CONTEXT_CHARS).slice(0, MAX_PAGE_CONTEXT_CHARS);
+}
+
+// --- capture: iframe bridge ----------------------------------------------
+
+// Runs in every non-top frame: report this frame's visible MCQ when the top
+// frame asks.
+function localQuestionContext() {
+  const mcq = detectMCQGroup();
+  if (!mcq) return { options: [] };
+  return {
+    question_text: mcq.questionText,
+    options: mcq.options,
+    frame_url: location.href,
+  };
+}
+
+function installFrameResponder() {
+  window.addEventListener('message', (event) => {
+    const data = event.data;
+    if (!data || data.type !== BRIDGE_REQUEST || typeof data.id !== 'string') return;
+    // Only our own top frame may ask. A nested or sibling frame cannot.
+    if (event.source !== window.top) return;
+
+    let payload;
     try {
-      parts.push(f.contentDocument.body.innerText || '');
+      payload = localQuestionContext();
+    } catch (e) {
+      payload = { options: [] };
+    }
+    try {
+      window.top.postMessage({ type: BRIDGE_RESPONSE, id: data.id, ...payload }, '*');
+    } catch (e) { /* ignore */ }
+  });
+}
+
+function pickBestFrameReply(replies) {
+  const usable = replies.filter(reply => Array.isArray(reply.options) && reply.options.length >= 2);
+  if (!usable.length) return null;
+  // Prefer the frame showing the richest visible option set.
+  return usable.slice().sort((a, b) => b.options.length - a.options.length)[0];
+}
+
+// Runs in the top frame: broadcast a request and collect replies.
+function askFramesForQuestion(timeoutMs = BRIDGE_TIMEOUT_MS) {
+  const frames = Array.from(window.frames || []);
+  if (!frames.length) return Promise.resolve(null);
+
+  const id = `alc-${++bridgeSeq}-${Date.now()}`;
+
+  return new Promise((resolve) => {
+    const replies = [];
+    let settled = false;
+
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      window.removeEventListener('message', onMessage);
+      resolve(pickBestFrameReply(replies));
+    };
+
+    const onMessage = (event) => {
+      const data = event.data;
+      if (!data || data.type !== BRIDGE_RESPONSE || data.id !== id) return;
+      // Only windows we actually posted to. A page script can call
+      // postMessage(), but it cannot forge event.source.
+      if (!frames.includes(event.source)) return;
+      if (!Array.isArray(data.options)) return;
+      replies.push(data);
+      if (replies.length >= frames.length) finish();
+    };
+
+    const timer = setTimeout(finish, timeoutMs);
+
+    window.addEventListener('message', onMessage);
+    for (const frame of frames) {
+      try { frame.postMessage({ type: BRIDGE_REQUEST, id }, '*'); } catch (e) { /* ignore */ }
+    }
+  });
+}
+
+async function getQuestionContext(action = '') {
+  const title = document.title;
+  const url = location.href;
+  const selection = currentSelection();
+  const wantsMcq = action === 'mcq-explain';
+
+  if (selection) {
+    return {
+      source: 'selection',
+      label: 'selection',
+      question_text: selection.slice(0, MAX_QUESTION_CHARS),
+      options: [],
+      context_text: wantsMcq ? fullPageContext() : viewportText(MAX_CONTEXT_CHARS),
+      page_title: title,
+      url,
+    };
+  }
+
+  const mcq = detectMCQGroup();
+  if (mcq) {
+    return {
+      source: 'mcq',
+      label: 'detected question',
+      question_text: mcq.questionText.slice(0, MAX_QUESTION_CHARS),
+      options: mcq.options,
+      context_text: mcq.questionText.slice(0, MAX_CONTEXT_CHARS),
+      page_title: title,
+      url,
+    };
+  }
+
+  if (IS_TOP_FRAME) {
+    const frameMcq = await askFramesForQuestion();
+    if (frameMcq) {
+      const frameText = String(frameMcq.question_text || '');
+      return {
+        source: 'frame',
+        label: 'detected question (iframe)',
+        question_text: frameText.slice(0, MAX_QUESTION_CHARS),
+        options: frameMcq.options,
+        context_text: frameText.slice(0, MAX_CONTEXT_CHARS),
+        page_title: title,
+        url,
+      };
+    }
+  }
+
+  if (wantsMcq) {
+    // No options anywhere: hand the backend the whole cleaned page and let the
+    // explainer cut its own region.
+    const page = fullPageContext();
+    return {
+      source: 'page',
+      label: 'full page text',
+      question_text: page.slice(0, MAX_QUESTION_CHARS),
+      options: [],
+      context_text: page,
+      page_title: title,
+      url,
+    };
+  }
+
+  const visible = viewportText(MAX_VISIBLE_CHARS);
+  const heading = nearestHeading();
+  const context = [heading, visible].filter(Boolean).join('\n\n');
+  return {
+    source: 'visible',
+    label: 'visible text',
+    question_text: visible.slice(0, MAX_QUESTION_CHARS),
+    options: [],
+    context_text: context.slice(0, MAX_CONTEXT_CHARS),
+    page_title: title,
+    url,
+  };
+}
+
+function getPageText(limit = 0) {
+  const root = document.querySelector('main') || document.querySelector('#root') || document.body;
+  if (!root) return '';
+
+  const parts = [renderedText(root, limit)];
+  document.querySelectorAll('iframe').forEach(frame => {
+    try {
+      const doc = frame.contentDocument;
+      if (!doc || !doc.body) return;
+      const frameText = renderedText(doc.body, limit);
+      if (frameText) parts.push(frameText);
     } catch (e) { /* cross-origin, ignore */ }
   });
-  return parts.join('\n');
+  return parts.filter(Boolean).join('\n');
 }
 
 function guessLanguage(el) {
@@ -507,16 +1085,19 @@ function collectCodeInDoc(doc) {
   };
 
   doc.querySelectorAll('pre').forEach((pre, i) => {
+    if (isInWidget(pre)) return;
     const codeEl = pre.querySelector('code');
     add(pre.innerText, codeEl ? guessLanguage(codeEl) : '', i * 100);
   });
 
   doc.querySelectorAll('code').forEach((el, i) => {
+    if (isInWidget(el)) return;
     if (el.closest('pre')) return;
     add(el.innerText, guessLanguage(el), 1000 + i * 100);
   });
 
   doc.querySelectorAll('.view-lines, .cm-content, .ace_content, .cm-editor').forEach((el, i) => {
+    if (isInWidget(el)) return;
     const lineEls = el.querySelectorAll('.view-line, .cm-line, .ace_line');
     const lines = [];
     lineEls.forEach((lineEl, j) => {
@@ -528,6 +1109,7 @@ function collectCodeInDoc(doc) {
   });
 
   doc.querySelectorAll('textarea').forEach((el, i) => {
+    if (isInWidget(el)) return;
     if (el.value && el.value.length > 20) add(el.value, '', 3000 + i * 100);
   });
 
@@ -537,6 +1119,7 @@ function collectCodeInDoc(doc) {
 function getCodeBlocks() {
   let blocks = collectCodeInDoc(document);
   document.querySelectorAll('iframe').forEach(f => {
+    if (isInWidget(f)) return;
     try {
       blocks = blocks.concat(collectCodeInDoc(f.contentDocument));
     } catch (e) { /* cross-origin, ignore */ }
@@ -554,70 +1137,115 @@ function getCodeBlocks() {
   return parts.join('\n\n');
 }
 
-function pageHash() {
+function hashString(text) {
   let hash = 0;
-  const sample = getPageText().slice(0, 4000);
-  for (let i = 0; i < sample.length; i++) {
-    hash = ((hash << 5) - hash) + sample.charCodeAt(i);
+  for (let i = 0; i < text.length; i++) {
+    hash = ((hash << 5) - hash) + text.charCodeAt(i);
     hash |= 0;
   }
-  return hash;
+  return String(hash);
+}
+
+// Identity of the question being asked, from the detected stem+options only.
+// Selection state is deliberately excluded: chat history must survive the
+// user selecting, deselecting or letting a selection expire.
+function questionFingerprint() {
+  const mcq = detectMCQGroup();
+  if (!mcq) return '';
+  return `mcq:${hashString(`${mcq.questionText}|${mcq.options.join('|')}`)}`;
+}
+
+function isWidgetMutation(mutation) {
+  return isInWidget(mutation.target);
+}
+
+// Bounded debounce: each mutation pushes the check out, but never past
+// WATCH_MAX_DELAY_MS from the first one, so a page that mutates continuously
+// still gets checked instead of postponing forever.
+function scheduleCheck() {
+  const now = Date.now();
+  if (!watchFirstMutationAt) watchFirstMutationAt = now;
+
+  const elapsed = now - watchFirstMutationAt;
+  if (elapsed >= WATCH_MAX_DELAY_MS) {
+    if (mutationTimer) { clearTimeout(mutationTimer); mutationTimer = null; }
+    watchFirstMutationAt = 0;
+    checkPage();
+    return;
+  }
+
+  if (mutationTimer) clearTimeout(mutationTimer);
+  const wait = Math.min(WATCH_DEBOUNCE_MS, WATCH_MAX_DELAY_MS - elapsed);
+  mutationTimer = setTimeout(() => {
+    mutationTimer = null;
+    watchFirstMutationAt = 0;
+    checkPage();
+  }, wait);
 }
 
 function startPageWatcher() {
   const origPushState = history.pushState;
   history.pushState = function (...args) {
     const r = origPushState.apply(this, args);
-    setTimeout(() => onPageChanged(true), 200);
+    setTimeout(checkPage, 200);
     return r;
   };
-  window.addEventListener('popstate', () => setTimeout(() => onPageChanged(true), 200));
+  window.addEventListener('popstate', () => setTimeout(checkPage, 200));
 
-  new MutationObserver(() => {
-    if (mutationTimer) return;
-    mutationTimer = setTimeout(() => {
-      mutationTimer = null;
-      const hash = pageHash();
-      if (hash !== lastPageHash) {
-        lastPageHash = hash;
-        onPageChanged(false);
-      }
-    }, 700);
-  }).observe(document.body, { childList: true, subtree: true });
+  new MutationObserver((mutations) => {
+    // The widget animates and re-renders constantly; never let it trigger us.
+    if (mutations.length && mutations.every(isWidgetMutation)) return;
+    scheduleCheck();
+  }).observe(document.body, { childList: true, subtree: true, characterData: true });
 
-  setInterval(() => {
-    const hash = pageHash();
-    if (hash !== lastPageHash) {
-      lastPageHash = hash;
-      onPageChanged(false);
-    }
-  }, 3000);
+  // Seed the signature so the question already on screen is not reported as a
+  // change by the first ordinary mutation.
+  lastQuestionSignature = questionFingerprint();
 }
 
-function onPageChanged(isUrlChange) {
+function showChatNotice(text) {
+  const msgContainer = document.getElementById('alc-chat-messages');
+  if (!msgContainer) return;
+  msgContainer.innerHTML = '';
+  const notice = document.createElement('div');
+  notice.className = 'alc-chat-notice';
+  notice.textContent = text;
+  msgContainer.appendChild(notice);
+  chatInitialized = true;
+}
+
+function checkPage() {
   const urlChanged = location.href !== lastUrl;
+  const fingerprint = questionFingerprint();
+  const questionChanged = !!fingerprint && fingerprint !== lastQuestionSignature;
+
+  // Ordinary page churn is not a reason to throw away the conversation.
+  if (!urlChanged && !questionChanged) return;
+
+  // Defer while the user is typing, and critically: do NOT consume the
+  // transition. lastUrl/lastQuestionSignature stay put so the change is still
+  // pending and gets handled by the next check.
+  const input = document.getElementById('alc-chat-input');
+  if (input && document.activeElement === input && input.value.trim()) return;
+
   if (urlChanged) {
     lastUrl = location.href;
+    // A selection from the previous page must not follow us across.
+    lastSelection = { text: '', ts: 0 };
+    lastQuestionSignature = fingerprint;
+  } else if (questionChanged) {
+    lastQuestionSignature = fingerprint;
   }
-  const input = document.getElementById('alc-chat-input');
-  const isTyping = input && document.activeElement === input && input.value.trim();
-  if (isTyping) return;
 
   chatHistory = [];
   chatInitialized = false;
-  const msgContainer = document.getElementById('alc-chat-messages');
-  if (!msgContainer) return;
-  const panel = document.getElementById('alc-panel');
-  const chatOpen = panel && panel.classList.contains('open') &&
-    document.getElementById('alc-chat-view').style.display !== 'none';
-
-  if (chatOpen) {
-    const label = urlChanged || isUrlChange ? 'New page detected — chat reset. Ask about this question.' : 'Page content changed — chat reset.';
-    msgContainer.innerHTML = `<div style="text-align:center;color:var(--alc-text-muted);padding:20px;font-size:13px;">${label}</div>`;
-  } else {
-    msgContainer.innerHTML = '';
-  }
   if (input) input.value = '';
+
+  showChatNotice(
+    urlChanged
+      ? 'New page detected — ask about this question.'
+      : 'New question detected — chat reset.'
+  );
 }
 
 function resetChat(showMsg) {
@@ -789,11 +1417,35 @@ function escapeHtml(str) {
   return div.innerHTML;
 }
 
+function captureBannerHtml(ctx, forceExpanded) {
+  if (!ctx) return '';
+  const label = ctx.label || ctx.source || 'page';
+  let html = `<div class="alc-capture">Using: <strong>${escapeHtml(label)}</strong></div>`;
+
+  if (forceExpanded || previewCapture) {
+    const bits = [];
+    if (ctx.question_text) bits.push(`Question / selection:\n${ctx.question_text}`);
+    if (ctx.options && ctx.options.length) {
+      bits.push(`Options:\n${ctx.options.map((o, i) => `${String.fromCharCode(65 + i)}. ${o}`).join('\n')}`);
+    }
+    if (ctx.context_text) bits.push(`Context:\n${ctx.context_text}`);
+    html += `<pre class="alc-capture-preview">${escapeHtml(bits.join('\n\n') || '(nothing captured)')}</pre>`;
+  }
+  return html;
+}
+
+async function showCapturePreview() {
+  const ctx = await getQuestionContext();
+  lastCapture = ctx;
+  showResult(captureBannerHtml(ctx, true));
+}
+
 async function doAction(action) {
-  const sel = window.getSelection().toString().trim();
-  const text = sel || getPageText();
-  const title = document.title;
-  const codeContext = getCodeBlocks();
+  const ctx = await getQuestionContext(action);
+  lastCapture = ctx;
+  // Code blocks are only useful for coding help; sending them with an MCQ or
+  // an explanation just burns context and confuses the model.
+  const codeContext = action === 'coding-help' ? getCodeBlocks() : '';
 
   showLoading();
 
@@ -803,24 +1455,33 @@ async function doAction(action) {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         action,
-        text: text.slice(0, 6000),
-        title,
+        text: ctx.question_text,
+        options: ctx.options && ctx.options.length ? ctx.options : undefined,
+        context: ctx.context_text,
+        title: ctx.page_title,
         code_context: codeContext || undefined,
       }),
     });
-    if (!res.ok) throw new Error((await res.json().catch(() => ({}))).detail || 'Request failed');
+    if (!res.ok) {
+      const detail = (await res.json().catch(() => ({}))).detail || '';
+      // 502 is the backend's "the model produced nothing usable" signal.
+      if (res.status === 502 || /model failed/i.test(detail)) {
+        throw new Error('Model failed, retry');
+      }
+      throw new Error(detail || 'Request failed');
+    }
     const data = await res.json();
-    renderResult(action, data);
+    renderResult(action, data, ctx);
   } catch (e) {
     const msg = e.message.includes('fetch') ? 'Cannot reach backend. Is it running on localhost:8000?' : e.message;
     showError(msg);
   }
 }
 
-function renderResult(action, data) {
+function renderResult(action, data, ctx) {
   if (data.error) { showError(data.error); return; }
 
-  let html = '';
+  let html = captureBannerHtml(ctx);
 
   if (action === 'explain') {
     html += `<div>${escapeHtml(data.response || data.explanation || '(no response)')}</div>`;
@@ -888,9 +1549,9 @@ async function sendChatMessage() {
 
   chatHistory.push({ role: "user", content: text });
 
-  const pageContext = getPageText().slice(0, 12000);
-  const codeContext = getCodeBlocks();
+  const pageContext = getPageText().slice(0, MAX_PAGE_CHARS);
   const codeIntent = /\b(code|write|implement|solve|solution|function|program|snippet|fix|syntax)\b/i.test(text);
+  const codeContext = codeIntent ? getCodeBlocks() : '';
 
   try {
     const res = await fetch(`${API_BASE}/api/extension/ask`, {
@@ -921,6 +1582,11 @@ async function sendChatMessage() {
 }
 
 function init() {
+  if (!IS_TOP_FRAME) {
+    // Sub-frames never render the widget; they only answer bridge requests.
+    installFrameResponder();
+    return;
+  }
   if (document.readyState === 'loading') {
     document.addEventListener('DOMContentLoaded', injectWidget);
   } else {

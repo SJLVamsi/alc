@@ -45,15 +45,131 @@ class TestCodingAssistant:
 
 
 class TestMCQExplainer:
-    def test_fallback_explanation(self):
+    @pytest.mark.asyncio
+    async def test_supplied_options_skip_extraction(self):
         from app.services.mcq_explainer import MCQExplainer
+
         mcq = MCQExplainer()
-        result = mcq._fallback_explanation("Test question", [
-            {"label": "A", "text": "Option A"},
-            {"label": "B", "text": "Option B"},
+        with patch(
+            "app.services.mcq_explainer.generate_json",
+            side_effect=AssertionError("should not call the model"),
+        ):
+            result = await mcq.extract_question(
+                page_text="ignored",
+                question_text="Which is FIFO?",
+                options=["Stack", "Queue"],
+            )
+
+        assert result["source"] == "supplied"
+        assert [o["label"] for o in result["options"]] == ["A", "B"]
+        assert [o["text"] for o in result["options"]] == ["Stack", "Queue"]
+
+    @pytest.mark.asyncio
+    async def test_regex_extracts_options_from_messy_page(self):
+        from app.services.mcq_explainer import MCQExplainer
+
+        page = "\n".join([
+            "NxtWave  Courses  Practice  Contests",
+            "1. Home",
+            "2. Profile",
+            "Which data structure follows FIFO ordering?",
+            "A) Stack",
+            "B) Queue",
+            "C) Binary tree",
+            "D) Hash map",
+            "Submit",
         ])
-        assert len(result["options"]) == 2
-        assert result["suggested_answer"] == "A"
+        mcq = MCQExplainer()
+        result = await mcq.extract_question(page_text=page)
+
+        assert result["source"] == "regex"
+        assert [o["text"] for o in result["options"]] == [
+            "Stack", "Queue", "Binary tree", "Hash map",
+        ]
+        assert "FIFO" in result["question_text"]
+        # nav entries must not become options
+        assert "Home" not in " ".join(o["text"] for o in result["options"])
+
+    def test_regex_handles_lowercase_and_numeric_markers(self):
+        from app.services.mcq_explainer import find_option_run
+
+        options, _ = find_option_run("Pick one\n(a) alpha\n(b) beta\n(c) gamma")
+        assert [o["text"] for o in options] == ["alpha", "beta", "gamma"]
+
+        options, _ = find_option_run("Pick one\n1. one\n2. two\n3. three")
+        assert [o["text"] for o in options] == ["one", "two", "three"]
+
+    @pytest.mark.asyncio
+    async def test_never_defaults_to_option_a_when_model_fails(self):
+        from app.core.exceptions import LLMError
+        from app.services.mcq_explainer import MCQExplainer
+
+        mcq = MCQExplainer()
+        with patch(
+            "app.services.mcq_explainer.generate_json",
+            side_effect=LLMError("model did not return usable JSON"),
+        ):
+            with pytest.raises(LLMError):
+                await mcq.explain_question("Q?", ["one", "two"])
+
+    @pytest.mark.asyncio
+    async def test_fenced_json_answer_b_stays_b(self):
+        from app.services.mcq_explainer import MCQExplainer
+
+        mcq = MCQExplainer()
+        with patch(
+            "app.services.mcq_explainer.generate_json",
+            return_value={
+                "options": [
+                    {"label": "A", "explanation": "Stack is LIFO."},
+                    {"label": "B", "explanation": "Queue is FIFO."},
+                ],
+                "suggested_answer": "B",
+                "overall_reasoning": "FIFO means first in, first out.",
+            },
+        ):
+            result = await mcq.explain_question("FIFO?", ["Stack", "Queue"])
+
+        assert result["suggested_answer"] == "B"
+        assert [o["is_correct"] for o in result["options"]] == [False, True]
+        assert result["options"][1]["text"] == "Queue"
+
+    @pytest.mark.asyncio
+    async def test_answer_outside_option_set_is_rejected(self):
+        from app.core.exceptions import LLMError
+        from app.services.mcq_explainer import MCQExplainer
+
+        mcq = MCQExplainer()
+        with patch(
+            "app.services.mcq_explainer.generate_json",
+            return_value={
+                "options": [],
+                "suggested_answer": "E",
+                "overall_reasoning": "made up",
+            },
+        ):
+            with pytest.raises(LLMError, match="not one of the options"):
+                await mcq.explain_question("FIFO?", ["Stack", "Queue"])
+
+    @pytest.mark.asyncio
+    async def test_option_text_comes_from_the_page_not_the_model(self):
+        from app.services.mcq_explainer import MCQExplainer
+
+        mcq = MCQExplainer()
+        with patch(
+            "app.services.mcq_explainer.generate_json",
+            return_value={
+                "options": [
+                    {"label": "A", "text": "INVENTED", "explanation": "e1"},
+                    {"label": "B", "text": "ALSO INVENTED", "explanation": "e2"},
+                ],
+                "suggested_answer": "B",
+                "overall_reasoning": "r",
+            },
+        ):
+            result = await mcq.explain_question("Q", ["Real A", "Real B"])
+
+        assert [o["text"] for o in result["options"]] == ["Real A", "Real B"]
 
 
 class TestKnowledgeBase:

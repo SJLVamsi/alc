@@ -1,5 +1,7 @@
 from unittest.mock import patch
 
+from app.core.exceptions import LLMError
+
 
 def test_extension_explain(client):
     with patch("app.api.routes.extension.llm_client.generate", return_value="A clear explanation."):
@@ -110,8 +112,11 @@ def test_extension_coding_help_with_code(client):
 
 
 def test_extension_mcq_uses_supplied_options_without_extraction(client):
-    """When the DOM already gave us the options, skip the extraction LLM call."""
+    """When the DOM already gave us the options, no model call is needed."""
     with patch(
+        "app.services.mcq_explainer.generate_json",
+        side_effect=AssertionError("should not call the model"),
+    ), patch(
         "app.api.routes.extension.mcq_explainer.explain_question",
         return_value={
             "options": [
@@ -121,9 +126,7 @@ def test_extension_mcq_uses_supplied_options_without_extraction(client):
             "suggested_answer": "B",
             "overall_reasoning": "FIFO",
         },
-    ) as mock_explain, patch(
-        "app.api.routes.extension.mcq_explainer.extract_question"
-    ) as mock_extract:
+    ) as mock_explain:
         resp = client.post("/api/extension/ask", json={
             "action": "mcq-explain",
             "text": "Which structure is FIFO?",
@@ -131,31 +134,37 @@ def test_extension_mcq_uses_supplied_options_without_extraction(client):
         })
 
     assert resp.status_code == 200
-    mock_extract.assert_not_called()
     passed_options = mock_explain.call_args.args[1]
     assert passed_options == [{"label": "A", "text": "Stack"},
                               {"label": "B", "text": "Queue"}]
     data = resp.json()
     assert data["question_text"] == "Which structure is FIFO?"
     assert data["suggested_answer"] == "B"
+    assert data["capture_source"] == "supplied"
 
 
-def test_extension_mcq_falls_back_to_extraction_without_options(client):
+def test_extension_mcq_regex_path_needs_no_model(client):
+    page = "\n".join([
+        "Some nav junk",
+        "Which structure is FIFO?",
+        "A. Stack",
+        "B. Queue",
+    ])
     with patch(
-        "app.api.routes.extension.mcq_explainer.extract_question",
-        return_value={"question_text": "Pick one", "options": []},
-    ) as mock_extract, patch(
+        "app.services.mcq_explainer.generate_json",
+        side_effect=AssertionError("regex should have handled extraction"),
+    ), patch(
         "app.api.routes.extension.mcq_explainer.explain_question",
-        return_value={"options": [], "suggested_answer": "A", "overall_reasoning": "r"},
-    ):
+        return_value={"options": [], "suggested_answer": "B", "overall_reasoning": "r"},
+    ) as mock_explain:
         resp = client.post("/api/extension/ask", json={
             "action": "mcq-explain",
-            "context": "Some page text with a question in it.",
+            "context": page,
         })
 
     assert resp.status_code == 200
-    mock_extract.assert_called_once()
-    assert resp.json()["question_text"] == "Pick one"
+    assert resp.json()["capture_source"] == "regex"
+    assert [o["text"] for o in mock_explain.call_args.args[1]] == ["Stack", "Queue"]
 
 
 def test_extension_normalizes_option_labels_and_caps_at_26(client):
@@ -186,11 +195,42 @@ def test_extension_drops_blank_options(client):
         client.post("/api/extension/ask", json={
             "action": "mcq-explain",
             "text": "q",
-            "options": ["First", "   ", ""],
+            "options": ["First", "   ", "", "Second"],
         })
 
     passed = mock_explain.call_args.args[1]
-    assert passed == [{"label": "A", "text": "First"}]
+    assert passed == [{"label": "A", "text": "First"}, {"label": "B", "text": "Second"}]
+
+
+def test_extension_mcq_model_failure_returns_502(client):
+    with patch(
+        "app.api.routes.extension.mcq_explainer.explain_question",
+        side_effect=LLMError("model did not return usable JSON"),
+    ):
+        resp = client.post("/api/extension/ask", json={
+            "action": "mcq-explain",
+            "text": "Which structure is FIFO?",
+            "options": ["Stack", "Queue"],
+        })
+
+    assert resp.status_code == 502
+    assert resp.json()["detail"] == "Model failed, retry"
+
+
+def test_extension_never_returns_a_guessed_answer_on_failure(client):
+    """A model failure must not be papered over with a defaulted option."""
+    with patch(
+        "app.api.routes.extension.mcq_explainer.explain_question",
+        side_effect=LLMError("nope"),
+    ):
+        resp = client.post("/api/extension/ask", json={
+            "action": "mcq-explain",
+            "text": "q",
+            "options": ["one", "two"],
+        })
+
+    assert resp.status_code == 502
+    assert "suggested_answer" not in resp.json()
 
 
 def test_extension_explain_uses_context_when_text_missing(client):
@@ -203,3 +243,33 @@ def test_extension_explain_uses_context_when_text_missing(client):
 
     assert resp.status_code == 200
     assert "Context-only explanation source." in mock_gen.call_args.args[0]
+
+
+def test_extension_mcq_extracts_options_via_model_when_page_gives_none(client):
+    """Only the bounded captured region is sent, not the first N page chars."""
+    captured = {}
+
+    async def fake_generate_json(prompt, required_fields=(), **kwargs):
+        captured["prompt"] = prompt
+        return {
+            "question_text": "Which is FIFO?",
+            "options": [{"label": "A", "text": "Stack"}, {"label": "B", "text": "Queue"}],
+        }
+
+    with patch(
+        "app.services.mcq_explainer.generate_json",
+        new=fake_generate_json,
+    ), patch(
+        "app.api.routes.extension.mcq_explainer.explain_question",
+        return_value={"options": [], "suggested_answer": "B", "overall_reasoning": "r"},
+    ):
+        resp = client.post("/api/extension/ask", json={
+            "action": "mcq-explain",
+            "text": "Which is FIFO?",
+            "context": "TRAILING PAGE NOISE " * 2000,
+        })
+
+    assert resp.status_code == 200
+    assert resp.json()["capture_source"] == "model"
+    # the huge context tail must have been trimmed out of the prompt
+    assert "TRAILING PAGE NOISE" not in captured["prompt"]

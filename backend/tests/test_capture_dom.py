@@ -174,7 +174,7 @@ def stub_api():
     """Intercept the real request so we can assert on what was sent."""
     calls = []
 
-    def _stub(page, response=None, path="**/api/extension/ask"):
+    def _stub(page, response=None, path="**/api/extension/ask", status=200):
         payload = json.dumps(response or {"response": "stub reply"})
 
         def handler(route):
@@ -182,7 +182,7 @@ def stub_api():
                 "url": route.request.url,
                 "body": route.request.post_data_json,
             })
-            route.fulfill(status=200, content_type="application/json", body=payload)
+            route.fulfill(status=status, content_type="application/json", body=payload)
 
         page.route(path, handler)
         return calls
@@ -253,6 +253,14 @@ def test_explain_action_never_sends_code_context(load_page, stub_api):
     page.evaluate("doAction('explain')")
 
     assert "code_context" not in calls[0]["body"]
+
+
+def test_model_failure_shows_retry_message(load_page, stub_api):
+    page = load_page(MCQ_PAGE)
+    stub_api(page, response={"detail": "Model failed, retry"}, status=502)
+    page.evaluate("doAction('mcq-explain')")
+
+    assert "Model failed, retry" in page.inner_text("#alc-content")
 
 
 def test_question_fingerprint_tracks_detected_mcq(load_page):

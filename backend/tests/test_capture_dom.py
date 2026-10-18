@@ -4,6 +4,7 @@ Runs the real content script inside Chromium against fixture pages and
 exercises getQuestionContext()/getPageText(). Skipped when a Playwright
 browser is not installed, so `make test` still works without one.
 """
+import json
 import pathlib
 
 import pytest
@@ -166,3 +167,91 @@ def test_context_lengths_are_capped(load_page):
 def test_strip_option_marker(load_page, raw, expected):
     page = load_page(PLAIN_PAGE)
     assert page.evaluate("raw => stripOptionMarker(raw)", raw) == expected
+
+
+@pytest.fixture
+def stub_api():
+    """Intercept the real request so we can assert on what was sent."""
+    calls = []
+
+    def _stub(page, response=None, path="**/api/extension/ask"):
+        payload = json.dumps(response or {"response": "stub reply"})
+
+        def handler(route):
+            calls.append({
+                "url": route.request.url,
+                "body": route.request.post_data_json,
+            })
+            route.fulfill(status=200, content_type="application/json", body=payload)
+
+        page.route(path, handler)
+        return calls
+
+    return _stub
+
+
+def test_mcq_action_sends_captured_stem_and_options(load_page, stub_api):
+    page = load_page(MCQ_PAGE)
+    calls = stub_api(page)
+    page.evaluate("doAction('mcq-explain')")
+
+    assert len(calls) == 1
+    body = calls[0]["body"]
+    assert calls[0]["url"].endswith("/api/extension/ask")
+    assert body["action"] == "mcq-explain"
+    assert body["options"] == ["Stack", "Queue", "Tree"]
+    assert "Which data structure is FIFO?" in body["text"]
+    assert body["context"]
+    # Spec A step 4: no code context for MCQ
+    assert "code_context" not in body
+
+
+def test_result_shows_what_was_captured(load_page, stub_api):
+    page = load_page(MCQ_PAGE)
+    stub_api(page)
+    page.evaluate("doAction('mcq-explain')")
+
+    banner = page.inner_text(".alc-capture")
+    assert "Using:" in banner
+    assert "detected question" in banner
+
+
+def test_preview_toggle_reveals_captured_text(load_page, stub_api):
+    page = load_page(MCQ_PAGE)
+    stub_api(page)
+    page.evaluate("previewCapture = true")
+    page.evaluate("doAction('mcq-explain')")
+
+    preview = page.inner_text(".alc-capture-preview")
+    assert "Which data structure is FIFO?" in preview
+    assert "A. Stack" in preview
+
+
+def test_coding_help_still_sends_code_context(browser, tmp_path, stub_api):
+    html = """
+    <html><head><title>Code page</title></head><body>
+    <p>Implement two_sum(nums, target).</p>
+    <pre><code class="language-python">def two_sum(nums, target):
+    pass</code></pre>
+    </body></html>
+    """
+    path = tmp_path / "code.html"
+    path.write_text(html, encoding="utf-8")
+    page = browser.new_page()
+    page.goto(path.as_uri())
+    page.add_script_tag(path=str(CONTENT_JS))
+
+    calls = stub_api(page)
+    page.evaluate("doAction('coding-help')")
+
+    assert "two_sum" in calls[0]["body"]["code_context"]
+
+
+def test_explain_action_never_sends_code_context(load_page, stub_api):
+    page = load_page(PLAIN_PAGE)
+    calls = stub_api(page)
+    page.evaluate("doAction('explain')")
+
+    assert "code_context" not in calls[0]["body"]
+
+

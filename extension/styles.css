@@ -250,6 +250,58 @@
   font-size: 14px;
 }
 
+/* Capture source banner, preview toggle and captured-text preview (Spec A) */
+.alc-capture {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  color: var(--alc-text-muted);
+  margin-bottom: 8px;
+  padding: 4px 8px;
+  border: 1px dashed var(--alc-border);
+  border-radius: 6px;
+  background: rgba(59,130,246,0.06);
+}
+
+.alc-capture strong { color: var(--alc-primary); }
+
+.alc-capture-toggle {
+  display: flex;
+  justify-content: flex-end;
+  margin-bottom: 6px;
+}
+
+.alc-capture-toggle label {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  color: var(--alc-text-muted);
+  cursor: pointer;
+  user-select: none;
+}
+
+.alc-capture-toggle input {
+  accent-color: var(--alc-primary);
+  margin: 0;
+}
+
+.alc-capture-preview {
+  margin: 8px 0 0;
+  padding: 8px 10px;
+  border-radius: 6px;
+  background: rgba(0,0,0,0.25);
+  border: 1px solid var(--alc-border);
+  font-size: 11px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  color: var(--alc-text-muted);
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 160px;
+  overflow-y: auto;
+}
+
 .alc-footer-text {
   font-size: 10px;
   text-align: center;

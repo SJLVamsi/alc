@@ -29,6 +29,11 @@ const html = `
           Select text on the page or use tools below.
         </div>
         <div id="alc-content"></div>
+        <div class="alc-capture-toggle">
+          <label title="Show the exact text sent to the AI">
+            <input type="checkbox" id="alc-preview-toggle"> Preview captured text
+          </label>
+        </div>
         <div class="alc-section">
           <div class="alc-section-title">Tools</div>
           <div class="alc-tools">
@@ -74,6 +79,8 @@ let lastPageHash = '';
 let mutationTimer = null;
 let lastSelection = { text: '', ts: 0 };
 let lastQuestionSignature = '';
+let previewCapture = false;
+let lastCapture = null;
 
 function injectWidget() {
   if (document.getElementById('alc-widget')) return;
@@ -108,6 +115,17 @@ function injectWidget() {
   enableResize();
   enableDrag();
   startPageWatcher();
+
+  const previewToggle = document.getElementById('alc-preview-toggle');
+  try { previewCapture = localStorage.getItem('alc_preview') === '1'; } catch (e) { /* ignore */ }
+  if (previewToggle) {
+    previewToggle.checked = previewCapture;
+    previewToggle.onchange = () => {
+      previewCapture = previewToggle.checked;
+      try { localStorage.setItem('alc_preview', previewCapture ? '1' : '0'); } catch (e) { /* ignore */ }
+      if (previewCapture) showCapturePreview();
+    };
+  }
 
   // Track the last real selection: clicking a panel button collapses it.
   ['mouseup', 'keyup', 'selectionchange'].forEach(evt =>
@@ -715,10 +733,32 @@ function escapeHtml(str) {
   return div.innerHTML;
 }
 
+function captureBannerHtml(ctx, forceExpanded) {
+  if (!ctx) return '';
+  const label = ctx.label || ctx.source || 'page';
+  let html = `<div class="alc-capture">Using: <strong>${escapeHtml(label)}</strong></div>`;
+
+  if (forceExpanded || previewCapture) {
+    const bits = [];
+    if (ctx.question_text) bits.push(`Question / selection:\n${ctx.question_text}`);
+    if (ctx.options && ctx.options.length) {
+      bits.push(`Options:\n${ctx.options.map((o, i) => `${String.fromCharCode(65 + i)}. ${o}`).join('\n')}`);
+    }
+    if (ctx.context_text) bits.push(`Context:\n${ctx.context_text}`);
+    html += `<pre class="alc-capture-preview">${escapeHtml(bits.join('\n\n') || '(nothing captured)')}</pre>`;
+  }
+  return html;
+}
+
+function showCapturePreview() {
+  const ctx = getQuestionContext();
+  lastCapture = ctx;
+  showResult(captureBannerHtml(ctx, true));
+}
+
 async function doAction(action) {
-  const sel = window.getSelection().toString().trim();
-  const text = sel || getPageText();
-  const title = document.title;
+  const ctx = getQuestionContext();
+  lastCapture = ctx;
   // Code blocks are only useful for coding help; sending them with an MCQ or
   // an explanation just burns context and confuses the model.
   const codeContext = action === 'coding-help' ? getCodeBlocks() : '';
@@ -731,24 +771,26 @@ async function doAction(action) {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         action,
-        text: text.slice(0, 6000),
-        title,
+        text: ctx.question_text,
+        options: ctx.options && ctx.options.length ? ctx.options : undefined,
+        context: ctx.context_text,
+        title: ctx.page_title,
         code_context: codeContext || undefined,
       }),
     });
     if (!res.ok) throw new Error((await res.json().catch(() => ({}))).detail || 'Request failed');
     const data = await res.json();
-    renderResult(action, data);
+    renderResult(action, data, ctx);
   } catch (e) {
     const msg = e.message.includes('fetch') ? 'Cannot reach backend. Is it running on localhost:8000?' : e.message;
     showError(msg);
   }
 }
 
-function renderResult(action, data) {
+function renderResult(action, data, ctx) {
   if (data.error) { showError(data.error); return; }
 
-  let html = '';
+  let html = captureBannerHtml(ctx);
 
   if (action === 'explain') {
     html += `<div>${escapeHtml(data.response || data.explanation || '(no response)')}</div>`;

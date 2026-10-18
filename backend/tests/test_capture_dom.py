@@ -670,6 +670,141 @@ def test_mcq_explain_without_options_prefers_full_page_over_viewport(load_page, 
     assert "Paragraph 119" in body["context"]
 
 
+# --- patch 2: iframe bridge ----------------------------------------------
+
+MAIN_WITH_FRAME = """
+<html><head><title>Course page</title></head><body>
+<main><h1>Lesson</h1><p>Watch the video below.</p></main>
+<iframe src="%s" width="800" height="400"></iframe>
+<script src="content.js"></script>
+</body></html>
+"""
+
+FRAME_MCQ = """
+<html><head><title>Frame quiz</title></head><body>
+<div class="quiz">
+  <p class="stem">Which data structure is FIFO?</p>
+  <label class="opt"><input type="radio" name="f1" value="a"> A. Stack</label>
+  <label class="opt"><input type="radio" name="f1" value="b"> B. Queue</label>
+</div>
+<script src="content.js"></script>
+</body></html>
+"""
+
+
+@pytest.fixture
+def frame_site(browser):
+    """Serve a top page plus an iframe on the same or a different origin."""
+    created = []
+    js = CONTENT_JS.read_text(encoding="utf-8")
+
+    def html_response(route, body):
+        route.fulfill(status=200, content_type="text/html", body=body)
+
+    def js_response(route):
+        route.fulfill(status=200, content_type="application/javascript", body=js)
+
+    def _make(frame_url):
+        context = browser.new_context(viewport={"width": 1200, "height": 800})
+        created.append(context)
+        main_html = MAIN_WITH_FRAME % frame_url
+
+        def main_handler(route):
+            if route.request.url == "http://main.test/":
+                html_response(route, main_html)
+            else:
+                js_response(route)
+
+        context.route("http://main.test/**", main_handler)
+
+        if frame_url.startswith("http://frame.test"):
+            def frame_handler(route):
+                if route.request.url.rstrip("/") in ("http://frame.test", "http://frame.test/frame.html"):
+                    html_response(route, FRAME_MCQ)
+                else:
+                    js_response(route)
+            context.route("http://frame.test/**", frame_handler)
+        else:
+            context.route(
+                "http://main.test/frame.html",
+                lambda route: html_response(route, FRAME_MCQ),
+            )
+
+        page = context.new_page()
+        page.goto("http://main.test/")
+        page.wait_for_timeout(250)
+        return page
+
+    yield _make
+    for context in created:
+        context.close()
+
+
+def test_same_origin_frame_question_is_picked_up(frame_site):
+    page = frame_site("http://main.test/frame.html")
+    ctx = page.evaluate("getQuestionContext('')")
+
+    assert ctx["source"] == "frame"
+    assert ctx["options"] == ["Stack", "Queue"]
+    assert "FIFO" in ctx["question_text"]
+
+
+def test_cross_origin_frame_question_is_picked_up(frame_site):
+    page = frame_site("http://frame.test/")
+    ctx = page.evaluate("getQuestionContext('')")
+
+    assert ctx["source"] == "frame"
+    assert ctx["options"] == ["Stack", "Queue"]
+
+
+def test_widget_is_only_injected_in_the_top_frame(frame_site):
+    page = frame_site("http://main.test/frame.html")
+
+    assert page.evaluate("document.querySelectorAll('#alc-widget').length") == 1
+    frame = page.frames[1]
+    assert frame.evaluate("document.querySelectorAll('#alc-widget').length") == 0
+
+
+def test_frame_only_answers_its_own_top_frame(frame_site):
+    page = frame_site("http://main.test/frame.html")
+    frame = page.frames[1]
+
+    reply = frame.evaluate("""async () => {
+        let seen = null;
+        window.addEventListener('message', e => {
+            if (e.data && e.data.type === 'ALC_QUESTION_RESPONSE') seen = e.data;
+        });
+        // a window posting to itself has event.source === window, not window.top
+        window.postMessage({type: 'ALC_QUESTION_REQUEST', id: 'spoofed'}, '*');
+        await new Promise(r => setTimeout(r, 120));
+        return seen;
+    }""")
+
+    assert reply is None
+
+
+def test_top_frame_ignores_a_spoofed_bridge_reply(frame_site):
+    page = frame_site("http://main.test/frame.html")
+
+    result = page.evaluate("""async () => {
+        const realNow = Date.now;
+        Date.now = () => 111;
+        const pending = askFramesForQuestion(400);
+        // correct id, but the source is the top window - not one of its frames
+        window.postMessage({
+            type: 'ALC_QUESTION_RESPONSE',
+            id: 'alc-' + bridgeSeq + '-111',
+            options: ['FAKE A', 'FAKE B'],
+        }, '*');
+        const result = await pending;
+        Date.now = realNow;
+        return result;
+    }""")
+
+    assert result["options"] == ["Stack", "Queue"]
+
+
+
 
 
 

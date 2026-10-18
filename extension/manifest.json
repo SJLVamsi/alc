@@ -11,6 +11,8 @@
       "js": ["content.js"],
       "css": ["styles.css"],
       "run_at": "document_idle",
+      "all_frames": true,
+      "match_about_blank": true,
       "exclude_matches": [
         "https://chrome.google.com/*",
         "https://accounts.google.com/*"

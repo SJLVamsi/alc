@@ -17,6 +17,17 @@ const WATCH_MAX_DELAY_MS = 4000;
 const SKIP_SELECTOR = 'nav, header, footer, aside, [role="navigation"], [role="banner"]';
 const SKIP_TAGS = new Set(['SCRIPT', 'STYLE', 'NOSCRIPT', 'TEMPLATE', 'NAV', 'HEADER', 'FOOTER', 'ASIDE']);
 
+// The widget lives in the top frame only; other frames just answer questions
+// about their own content.
+const IS_TOP_FRAME = (() => {
+  try { return window.top === window.self; } catch (e) { return false; }
+})();
+
+const BRIDGE_REQUEST = 'ALC_QUESTION_REQUEST';
+const BRIDGE_RESPONSE = 'ALC_QUESTION_RESPONSE';
+const BRIDGE_TIMEOUT_MS = 400;
+let bridgeSeq = 0;
+
 const html = `
 <div id="alc-widget">
   <div id="alc-panel">
@@ -444,6 +455,85 @@ function fullPageContext() {
   return getPageText(MAX_PAGE_CONTEXT_CHARS).slice(0, MAX_PAGE_CONTEXT_CHARS);
 }
 
+// --- capture: iframe bridge ----------------------------------------------
+
+// Runs in every non-top frame: report this frame's visible MCQ when the top
+// frame asks.
+function localQuestionContext() {
+  const mcq = detectMCQGroup();
+  if (!mcq) return { options: [] };
+  return {
+    question_text: mcq.questionText,
+    options: mcq.options,
+    frame_url: location.href,
+  };
+}
+
+function installFrameResponder() {
+  window.addEventListener('message', (event) => {
+    const data = event.data;
+    if (!data || data.type !== BRIDGE_REQUEST || typeof data.id !== 'string') return;
+    // Only our own top frame may ask. A nested or sibling frame cannot.
+    if (event.source !== window.top) return;
+
+    let payload;
+    try {
+      payload = localQuestionContext();
+    } catch (e) {
+      payload = { options: [] };
+    }
+    try {
+      window.top.postMessage({ type: BRIDGE_RESPONSE, id: data.id, ...payload }, '*');
+    } catch (e) { /* ignore */ }
+  });
+}
+
+function pickBestFrameReply(replies) {
+  const usable = replies.filter(reply => Array.isArray(reply.options) && reply.options.length >= 2);
+  if (!usable.length) return null;
+  // Prefer the frame showing the richest visible option set.
+  return usable.slice().sort((a, b) => b.options.length - a.options.length)[0];
+}
+
+// Runs in the top frame: broadcast a request and collect replies.
+function askFramesForQuestion(timeoutMs = BRIDGE_TIMEOUT_MS) {
+  const frames = Array.from(window.frames || []);
+  if (!frames.length) return Promise.resolve(null);
+
+  const id = `alc-${++bridgeSeq}-${Date.now()}`;
+
+  return new Promise((resolve) => {
+    const replies = [];
+    let settled = false;
+
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      window.removeEventListener('message', onMessage);
+      resolve(pickBestFrameReply(replies));
+    };
+
+    const onMessage = (event) => {
+      const data = event.data;
+      if (!data || data.type !== BRIDGE_RESPONSE || data.id !== id) return;
+      // Only windows we actually posted to. A page script can call
+      // postMessage(), but it cannot forge event.source.
+      if (!frames.includes(event.source)) return;
+      if (!Array.isArray(data.options)) return;
+      replies.push(data);
+      if (replies.length >= frames.length) finish();
+    };
+
+    const timer = setTimeout(finish, timeoutMs);
+
+    window.addEventListener('message', onMessage);
+    for (const frame of frames) {
+      try { frame.postMessage({ type: BRIDGE_REQUEST, id }, '*'); } catch (e) { /* ignore */ }
+    }
+  });
+}
+
 async function getQuestionContext(action = '') {
   const title = document.title;
   const url = location.href;
@@ -473,6 +563,22 @@ async function getQuestionContext(action = '') {
       page_title: title,
       url,
     };
+  }
+
+  if (IS_TOP_FRAME) {
+    const frameMcq = await askFramesForQuestion();
+    if (frameMcq) {
+      const frameText = String(frameMcq.question_text || '');
+      return {
+        source: 'frame',
+        label: 'detected question (iframe)',
+        question_text: frameText.slice(0, MAX_QUESTION_CHARS),
+        options: frameMcq.options,
+        context_text: frameText.slice(0, MAX_CONTEXT_CHARS),
+        page_title: title,
+        url,
+      };
+    }
   }
 
   if (wantsMcq) {
@@ -1041,6 +1147,11 @@ async function sendChatMessage() {
 }
 
 function init() {
+  if (!IS_TOP_FRAME) {
+    // Sub-frames never render the widget; they only answer bridge requests.
+    installFrameResponder();
+    return;
+  }
   if (document.readyState === 'loading') {
     document.addEventListener('DOMContentLoaded', injectWidget);
   } else {

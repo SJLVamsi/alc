@@ -596,9 +596,10 @@ def test_existing_mcq_does_not_reset_on_first_ordinary_mutation(load_page):
 def test_question_change_while_typing_is_deferred_not_lost(load_page):
     page = load_page(MCQ_PAGE)
     typing = page.evaluate("""() => {
+        lastQuestionSignature = 'stale-signature';
+        chatKey = currentChatKey();
         chatHistory = [{role: 'user', content: 'keep me'}];
         lastUrl = location.href;
-        lastQuestionSignature = 'stale-signature';
         document.getElementById('alc-panel').classList.add('open');
         switchTab('chat');
         const input = document.getElementById('alc-chat-input');

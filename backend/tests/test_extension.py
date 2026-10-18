@@ -107,3 +107,99 @@ def test_extension_coding_help_with_code(client):
         prompt = mock_gen.call_args.args[0]
         assert starter in prompt
         assert "function name" in prompt
+
+
+def test_extension_mcq_uses_supplied_options_without_extraction(client):
+    """When the DOM already gave us the options, skip the extraction LLM call."""
+    with patch(
+        "app.api.routes.extension.mcq_explainer.explain_question",
+        return_value={
+            "options": [
+                {"label": "A", "text": "Stack", "is_correct": False, "explanation": "no"},
+                {"label": "B", "text": "Queue", "is_correct": True, "explanation": "yes"},
+            ],
+            "suggested_answer": "B",
+            "overall_reasoning": "FIFO",
+        },
+    ) as mock_explain, patch(
+        "app.api.routes.extension.mcq_explainer.extract_question"
+    ) as mock_extract:
+        resp = client.post("/api/extension/ask", json={
+            "action": "mcq-explain",
+            "text": "Which structure is FIFO?",
+            "options": ["Stack", "Queue"],
+        })
+
+    assert resp.status_code == 200
+    mock_extract.assert_not_called()
+    passed_options = mock_explain.call_args.args[1]
+    assert passed_options == [{"label": "A", "text": "Stack"},
+                              {"label": "B", "text": "Queue"}]
+    data = resp.json()
+    assert data["question_text"] == "Which structure is FIFO?"
+    assert data["suggested_answer"] == "B"
+
+
+def test_extension_mcq_falls_back_to_extraction_without_options(client):
+    with patch(
+        "app.api.routes.extension.mcq_explainer.extract_question",
+        return_value={"question_text": "Pick one", "options": []},
+    ) as mock_extract, patch(
+        "app.api.routes.extension.mcq_explainer.explain_question",
+        return_value={"options": [], "suggested_answer": "A", "overall_reasoning": "r"},
+    ):
+        resp = client.post("/api/extension/ask", json={
+            "action": "mcq-explain",
+            "context": "Some page text with a question in it.",
+        })
+
+    assert resp.status_code == 200
+    mock_extract.assert_called_once()
+    assert resp.json()["question_text"] == "Pick one"
+
+
+def test_extension_normalizes_option_labels_and_caps_at_26(client):
+    options = [f"opt {i}" for i in range(28)]
+    with patch(
+        "app.api.routes.extension.mcq_explainer.explain_question",
+        return_value={"options": [], "suggested_answer": "", "overall_reasoning": ""},
+    ) as mock_explain:
+        client.post("/api/extension/ask", json={
+            "action": "mcq-explain",
+            "text": "long question",
+            "options": options,
+        })
+
+    passed = mock_explain.call_args.args[1]
+    labels = [o["label"] for o in passed]
+    assert labels[:3] == ["A", "B", "C"]
+    assert labels[-1] == "Z"
+    # defensive cap: a bad DOM read can't flood the prompt with options
+    assert len(passed) == 26
+
+
+def test_extension_drops_blank_options(client):
+    with patch(
+        "app.api.routes.extension.mcq_explainer.explain_question",
+        return_value={"options": [], "suggested_answer": "", "overall_reasoning": ""},
+    ) as mock_explain:
+        client.post("/api/extension/ask", json={
+            "action": "mcq-explain",
+            "text": "q",
+            "options": ["First", "   ", ""],
+        })
+
+    passed = mock_explain.call_args.args[1]
+    assert passed == [{"label": "A", "text": "First"}]
+
+
+def test_extension_explain_uses_context_when_text_missing(client):
+    with patch("app.api.routes.extension.llm_client.generate") as mock_gen:
+        mock_gen.return_value = "explained"
+        resp = client.post("/api/extension/ask", json={
+            "action": "explain",
+            "context": "Context-only explanation source.",
+        })
+
+    assert resp.status_code == 200
+    assert "Context-only explanation source." in mock_gen.call_args.args[0]

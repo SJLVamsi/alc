@@ -14,16 +14,30 @@ class ExtensionRequest(BaseModel):
     text: Optional[str] = None
     title: Optional[str] = None
     messages: Optional[list] = None
+    context: Optional[str] = None
     page_context: Optional[str] = None
+    options: Optional[list[str]] = None
     code_context: Optional[str] = None
     code_intent: Optional[bool] = False
+
+
+def _normalize_options(options: list[str]) -> list[dict]:
+    """DOM-extracted option strings -> the [{label, text}] the service expects.
+
+    Capped at 26 (A-Z): a mis-detected option group shouldn't flood the prompt.
+    """
+    return [
+        {"label": chr(ord("A") + i), "text": str(o).strip()}
+        for i, o in enumerate(options[:26])
+        if str(o).strip()
+    ]
 
 
 @router.post("/ask")
 async def extension_ask(req: ExtensionRequest):
     try:
         if req.action == "explain":
-            text = (req.text or "")[:4000]
+            text = (req.text or req.context or "")[:4000]
             prompt = f"""Explain the following concept in simple terms for a student.
 
 Content: {text}
@@ -62,7 +76,18 @@ Provide a clear, concise explanation with examples where helpful."""
             return result
 
         elif req.action == "mcq-explain":
-            text = (req.text or "")[:6000]
+            text = (req.text or req.context or "")[:6000]
+            normalized = _normalize_options(req.options or [])
+            if normalized:
+                # The page already told us the stem and options - skip the LLM
+                # extraction round-trip and go straight to the explanation.
+                explanation = await mcq_explainer.explain_question(text, normalized)
+                return {
+                    "question_text": text,
+                    "options": explanation.get("options", normalized),
+                    "suggested_answer": explanation.get("suggested_answer", ""),
+                    "overall_reasoning": explanation.get("overall_reasoning", ""),
+                }
             result = await mcq_explainer.extract_question(text)
             if not result.get("question_text"):
                 prompt = f"Find and explain the multiple choice question in this content:\n\n{text}"
@@ -79,7 +104,7 @@ Provide a clear, concise explanation with examples where helpful."""
             }
 
         elif req.action == "generate-notes":
-            text = (req.text or "")[:6000]
+            text = (req.context or req.text or "")[:6000]
             prompt = f"""Analyze this learning content and generate structured notes.
 
 Title: {req.title or 'Untitled'}

@@ -94,6 +94,29 @@ extension with the backend running and walk this list.
 - [ ] Navigate to another lesson → a **New page detected** notice appears.
 - [ ] Idle on a heavily animated page for a minute → no repeated chat resets.
 
+### Streaming chat
+- [ ] Ask a question in the Chat tab → tokens appear incrementally, not in one
+      block at the end.
+- [ ] The answer renders as markdown: headings, lists, bold, and fenced code
+      blocks with a working **Copy** button.
+- [ ] While an answer is streaming, **Send** is disabled and Enter does
+      nothing.
+- [ ] Click **Stop** mid-answer → generation halts, the bubble is marked
+      "(stopped)", and Send works again.
+- [ ] Click **Stop**, then immediately ask a different question → none of the
+      stopped answer's remaining text leaks into the new reply.
+- [ ] Advance to the next question while an answer is streaming → the stream
+      is cancelled and the old text does not appear in the new chat.
+- [ ] Ask "write the code for this" on a coding exercise → the reply matches
+      the starter code's function name and parameters.
+- [ ] Stop the backend and ask something → the panel shows
+      **Backend offline** with `cd alc && make backend`.
+- [ ] Restart the backend mid-conversation and ask again → it recovers without
+      a page reload (the extension resends the page body when the backend's
+      cache has expired).
+- [ ] Ask a follow-up → the page body is not resent (watch the network tab);
+      only `page_hash` goes up.
+
 ### Failure behaviour
 - [ ] Stop Ollama, then **Explain MCQ** → the panel shows
       **Model failed, retry**. It must never fall back to a guessed option.

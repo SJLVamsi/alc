@@ -85,11 +85,14 @@ class _FakeStreamResponse:
 
 
 class _FakeAsyncClient:
-    """Captures the payload and replays canned NDJSON lines."""
+    """Captures the payload and replays canned NDJSON lines / chat replies."""
 
-    def __init__(self, lines):
-        self._lines = lines
+    def __init__(self, lines=None, reply="fake reply"):
+        self._lines = lines or []
+        self._reply = reply
         self.payload = None
+        self.url = None
+        self.method = None
 
     def __call__(self, *args, **kwargs):
         return self
@@ -101,8 +104,23 @@ class _FakeAsyncClient:
         return False
 
     def stream(self, method, url, json=None):
-        self.payload = json
+        self.method, self.url, self.payload = method, url, json
         return _FakeStreamResponse(self._lines)
+
+    async def post(self, url, json=None):
+        self.method, self.url, self.payload = "POST", url, json
+        return _FakePostResponse(self._reply)
+
+
+class _FakePostResponse:
+    def __init__(self, reply):
+        self._reply = reply
+
+    def raise_for_status(self):
+        pass
+
+    def json(self):
+        return {"message": {"content": self._reply}}
 
 
 class TestLLMClientStreaming:
@@ -150,3 +168,66 @@ class TestLLMClientStreaming:
             chunks = [c async for c in client.chat_stream([{"role": "user", "content": "hi"}])]
 
         assert chunks == ["ok"]
+
+
+class TestLLMClientGenerate:
+    @pytest.mark.asyncio
+    async def test_generate_goes_through_chat_endpoint(self):
+        from app.services.llm_client import LLMClient
+
+        fake = _FakeAsyncClient(reply="the answer")
+        with patch("app.services.llm_client.httpx.AsyncClient", fake):
+            client = LLMClient()
+            out = await client.generate("What is a BST?")
+
+        assert out == "the answer"
+        assert fake.url.endswith("/api/chat")
+        assert fake.payload["messages"] == [{"role": "user", "content": "What is a BST?"}]
+        # callers' API is unchanged: one prompt in, text out
+
+    @pytest.mark.asyncio
+    async def test_generate_system_prompt_becomes_a_system_message(self):
+        from app.services.llm_client import LLMClient
+
+        fake = _FakeAsyncClient(reply="x")
+        with patch("app.services.llm_client.httpx.AsyncClient", fake):
+            client = LLMClient()
+            await client.generate("q", system_prompt="be terse")
+
+        assert fake.payload["messages"][0] == {"role": "system", "content": "be terse"}
+        assert fake.payload["messages"][1]["role"] == "user"
+
+    @pytest.mark.asyncio
+    async def test_json_mode_sets_format(self):
+        from app.services.llm_client import LLMClient
+
+        fake = _FakeAsyncClient(reply='{"a": 1}')
+        with patch("app.services.llm_client.httpx.AsyncClient", fake):
+            client = LLMClient()
+            await client.generate("q", json_mode=True)
+
+        assert fake.payload["format"] == "json"
+
+    @pytest.mark.asyncio
+    async def test_json_mode_is_off_by_default(self):
+        from app.services.llm_client import LLMClient
+
+        fake = _FakeAsyncClient(reply="plain")
+        with patch("app.services.llm_client.httpx.AsyncClient", fake):
+            client = LLMClient()
+            await client.generate("q")
+
+        assert "format" not in fake.payload
+
+    @pytest.mark.asyncio
+    async def test_options_carry_num_ctx_and_temperature(self):
+        from app.services.llm_client import LLMClient
+
+        fake = _FakeAsyncClient(reply="x")
+        with patch("app.services.llm_client.httpx.AsyncClient", fake):
+            client = LLMClient()
+            await client.generate("q")
+
+        options = fake.payload["options"]
+        assert options["num_ctx"] >= 8192
+        assert options["temperature"] == 0.2

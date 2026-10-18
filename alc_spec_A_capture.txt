@@ -1,0 +1,22 @@
+SPEC A - improve capture in extension/content.js (paste into opencode)
+
+Do not change the widget look. Small backend change at the end.
+
+1. Add getQuestionContext() returning {source, question_text, options[], context_text, page_title, url}. Priority order:
+ a. If window.getSelection() has 10+ chars, use it as question_text, source="selection". Cache the last non-empty selection on mouseup/keyup/selectionchange, and read the cache if the current selection is empty when a panel button was clicked (only if under 2 minutes old).
+ b. Else detect an MCQ block: groups of input[type=radio] or input[type=checkbox] sharing a name, plus role="radiogroup"/role="radio" elements and elements with class names matching /option|choice|answer/i that have 2-6 siblings. Pick the group closest to the viewport center (or first fully visible). Walk up to the smallest ancestor containing the whole group plus one text block before it (the stem). Use that ancestor's innerText as the question block. Build options[] from each option's label text (label[for], parent label, or element text), stripping a leading "A.", "A)", "(a)", "1." marker.
+ c. Else visible-text mode: collect text only from elements intersecting the viewport (getBoundingClientRect), skipping nav, header, footer, aside, [role=navigation], [role=banner] and the #alc-widget subtree. Cap 3000 chars.
+
+2. Always cap: question_text 2000 chars, context_text 4000 chars (nearby blocks or nearest heading). Never send the full page for tool actions.
+
+3. getPageText(): exclude the #alc-widget subtree (clone the root, remove it, read innerText). Skip script/style/nav/footer/aside. Iframes: same-origin as now. For cross-origin ones set "all_frames": true and "match_about_blank": true in manifest content_scripts, and let each frame's script reply to a request from the top frame with its own question context. Use the frame that has the radio group.
+
+4. Code capture: only send code_context when action is "coding-help" or the chat message has code intent. Not for MCQ or explain.
+
+5. Page watcher: remove the 3s setInterval and the pageHash() getPageText() call. In the MutationObserver ignore mutations inside #alc-widget, debounce 1500ms, and compare only location.href plus the detected question_text hash. Do not clear chat history on page text change; only clear when the URL changes or the detected question changes, then show a small "new question detected" notice instead of wiping silently.
+
+6. doAction: send {action, text: question_text, options, context: context_text, title, code_context?}. Show "Using: selection / detected question / visible text" at the top of the result so the student sees what was captured. Add a "preview captured text" toggle in the panel.
+
+7. Backend extension.py, mcq-explain branch: accept optional options in ExtensionRequest (list of str). If options is non-empty, skip LLM extraction and call explain_question(text, options) directly. (If backend step 1 is applied, use its structured extract_question.)
+
+Add a short manual test checklist in extension/README.md.

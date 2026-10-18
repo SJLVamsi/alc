@@ -1,0 +1,12 @@
+SPEC B - streaming "ask about this page" chat (paste into opencode, after backend step 1)
+
+Backend: POST /api/page/ask {page_text, selection?, question, history[], title, url} streams SSE (text/event-stream): chunks as data: {"delta": "..."} and a final data: [DONE]. Uses llm_client.chat_stream. System prompt: "Answer using the page content below. If the answer isn't on the page, say so, then answer from general knowledge. Be concise. Use markdown." Make sure num_ctx is at least 8192. Trim history to the last 6 turns. Allow CORS for chrome-extension origins and localhost.
+
+Extension (content.js):
+1. Replace the chat fetch with fetch + response.body.getReader(), decode SSE lines and append deltas to a single message element. Do not rebuild the DOM with innerHTML +=; create one element per message and update its textContent as chunks arrive.
+2. Add a Stop button (AbortController) and disable Send while streaming.
+3. Render replies as markdown: headings, bold, lists, fenced code blocks (with a Copy button). Small safe renderer that escapes HTML first. No external libs.
+4. Context per question: selection if any, else cleaned page text from getPageText() (as in Spec A). Send the page once per page-version, cache by URL + text hash; do not resend 12000 chars every turn if unchanged (backend can cache by hash for 5 minutes).
+5. Quick chips above the input: "Summarize this page", "Explain selection", "Quiz me on this". Each prefills a question.
+6. Keep chat history per URL in memory so reopening the panel shows the old conversation.
+7. Show a clear "Backend offline" state with the exact command to start it.

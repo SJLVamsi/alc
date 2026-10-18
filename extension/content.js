@@ -1,5 +1,16 @@
 const API_BASE = 'http://localhost:8000';
 
+// --- capture limits (Spec A) ---
+const MAX_QUESTION_CHARS = 2000;
+const MAX_CONTEXT_CHARS = 4000;
+const MAX_VISIBLE_CHARS = 3000;
+const MAX_PAGE_CHARS = 12000;
+const SELECTION_MIN_CHARS = 10;
+const SELECTION_TTL_MS = 2 * 60 * 1000;
+
+const SKIP_SELECTOR = 'nav, header, footer, aside, [role="navigation"], [role="banner"]';
+const SKIP_TAGS = new Set(['SCRIPT', 'STYLE', 'NOSCRIPT', 'TEMPLATE', 'NAV', 'HEADER', 'FOOTER', 'ASIDE']);
+
 const html = `
 <div id="alc-widget">
   <div id="alc-panel">
@@ -61,6 +72,8 @@ let chatInitialized = false;
 let lastUrl = location.href;
 let lastPageHash = '';
 let mutationTimer = null;
+let lastSelection = { text: '', ts: 0 };
+let lastQuestionSignature = '';
 
 function injectWidget() {
   if (document.getElementById('alc-widget')) return;
@@ -95,20 +108,305 @@ function injectWidget() {
   enableResize();
   enableDrag();
   startPageWatcher();
+
+  // Track the last real selection: clicking a panel button collapses it.
+  ['mouseup', 'keyup', 'selectionchange'].forEach(evt =>
+    document.addEventListener(evt, rememberSelection, true)
+  );
+}
+
+// --- capture: shared helpers ---------------------------------------------
+
+function isInWidget(el) {
+  if (!el) return false;
+  if (el.id === 'alc-widget') return true;
+  const node = el.nodeType === 1 ? el : el.parentElement;
+  return !!(node && node.closest && node.closest('#alc-widget'));
+}
+
+function stripOptionMarker(text) {
+  return (text || '')
+    .trim()
+    .replace(/^\(?([A-Za-z]|\d{1,2})[.):]\s*/, '')
+    .trim();
+}
+
+function cssEscape(value) {
+  if (window.CSS && CSS.escape) return CSS.escape(value);
+  return String(value).replace(/([^\w-])/g, '\\$1');
+}
+
+// --- capture: selection --------------------------------------------------
+
+function rememberSelection() {
+  let sel = '';
+  try {
+    sel = (window.getSelection() || '').toString().trim();
+  } catch (e) {
+    sel = '';
+  }
+  if (sel) lastSelection = { text: sel, ts: Date.now() };
+}
+
+function currentSelection() {
+  let sel = '';
+  try {
+    sel = (window.getSelection() || '').toString().trim();
+  } catch (e) {
+    sel = '';
+  }
+  if (sel.length >= SELECTION_MIN_CHARS) return sel;
+  // Button clicks steal focus and collapse the selection, so fall back to the
+  // most recent non-empty selection if it's still fresh.
+  if (Date.now() - lastSelection.ts < SELECTION_TTL_MS) return lastSelection.text;
+  return '';
+}
+
+// --- capture: MCQ detection ----------------------------------------------
+
+function collectOptionGroups(root) {
+  const groups = [];
+
+  const byName = new Map();
+  root.querySelectorAll('input[type="radio"], input[type="checkbox"]').forEach(el => {
+    const name = el.getAttribute('name');
+    if (!name) return;
+    const key = `${el.type}|${name}`;
+    if (!byName.has(key)) byName.set(key, []);
+    byName.get(key).push(el);
+  });
+  byName.forEach(els => { if (els.length >= 2) groups.push(els); });
+
+  root.querySelectorAll('[role="radiogroup"]').forEach(rg => {
+    const opts = Array.from(rg.querySelectorAll('[role="radio"]'));
+    if (opts.length >= 2) groups.push(opts);
+  });
+
+  root.querySelectorAll('[class]').forEach(el => {
+    const cls = (el.className || '').toString();
+    if (!/option|choice|answer/i.test(cls)) return;
+    const parent = el.parentElement;
+    if (!parent) return;
+    const siblings = Array.from(parent.children).filter(s =>
+      /option|choice|answer/i.test((s.className || '').toString())
+    );
+    if (siblings.length >= 2 && siblings.length <= 6) groups.push(siblings);
+  });
+
+  // Drop groups detected twice (same elements, e.g. class + role heuristics).
+  const seen = new Set();
+  return groups.filter(g => {
+    const sig = g.map(e => {
+      if (!e.__alcUid) e.__alcUid = Math.random().toString(36).slice(2);
+      return e.__alcUid;
+    }).sort().join(',');
+    if (seen.has(sig)) return false;
+    seen.add(sig);
+    return true;
+  });
+}
+
+function groupVisibility(els) {
+  const rects = els.map(e => e.getBoundingClientRect());
+  const onscreen = rects.filter(r => r.width > 0 && r.height > 0 && r.bottom > 0 && r.top < window.innerHeight);
+  if (!onscreen.length) return null;
+  const centre = onscreen.reduce((a, r) => a + r.top + r.height / 2, 0) / onscreen.length;
+  return {
+    fullyVisible: onscreen.length === rects.length,
+    distance: Math.abs(centre - window.innerHeight / 2),
+  };
+}
+
+function textBlockBefore(node, boundary) {
+  let cur = node;
+  while (cur && cur !== boundary) {
+    let sib = cur.previousElementSibling;
+    while (sib) {
+      const text = (sib.innerText || sib.textContent || '').trim();
+      if (text && !isInWidget(sib)) return text;
+      sib = sib.previousElementSibling;
+    }
+    cur = cur.parentElement;
+  }
+  return '';
+}
+
+function optionTextFor(el) {
+  let text = '';
+  if (el.tagName === 'INPUT') {
+    if (el.id) {
+      const lbl = document.querySelector(`label[for="${cssEscape(el.id)}"]`);
+      if (lbl) text = lbl.innerText || lbl.textContent || '';
+    }
+    if (!text) {
+      const wrap = el.closest('label');
+      if (wrap) text = wrap.innerText || wrap.textContent || '';
+    }
+    if (!text && el.parentElement) {
+      text = el.parentElement.innerText || el.parentElement.textContent || '';
+    }
+  } else {
+    text = el.innerText || el.textContent || '';
+  }
+  return stripOptionMarker(text);
+}
+
+function detectMCQGroup() {
+  const groups = collectOptionGroups(document);
+  let best = null;
+
+  for (const els of groups) {
+    const vis = groupVisibility(els);
+    if (!vis) continue;
+    const score = (vis.fullyVisible ? 0 : 1e6) + vis.distance;
+    if (!best || score < best.score) best = { els, score };
+  }
+  if (!best) return null;
+
+  // Smallest ancestor holding the whole group plus one preceding text block.
+  const first = best.els[0];
+  let container = null;
+  let stem = '';
+  let cur = first;
+  while (cur && cur !== document.body) {
+    cur = cur.parentElement;
+    if (!cur) break;
+    if (!best.els.every(e => cur.contains(e))) continue;
+    const before = textBlockBefore(first, cur);
+    if (before) { container = cur; stem = before; break; }
+    if (container === null) container = cur; // fallback: group-only ancestor
+  }
+  if (!container) return null;
+
+  const options = best.els.map(optionTextFor).filter(t => t.length > 0);
+  if (options.length < 2) return null;
+
+  const inViewport = best.els[0].getBoundingClientRect();
+  if (inViewport.top > window.innerHeight || inViewport.bottom < 0) return null;
+
+  return {
+    questionText: (container.innerText || container.textContent || stem).trim(),
+    stem,
+    options,
+  };
+}
+
+// --- capture: visible text -----------------------------------------------
+
+function viewportText(limit = MAX_VISIBLE_CHARS) {
+  const parts = [];
+  let total = 0;
+  const walker = document.createTreeWalker(document.body || document.documentElement, NodeFilter.SHOW_TEXT, {
+    acceptNode(node) {
+      const parent = node.parentElement;
+      if (!parent) return NodeFilter.FILTER_REJECT;
+      if (SKIP_TAGS.has(parent.tagName)) return NodeFilter.FILTER_REJECT;
+      if (isInWidget(parent)) return NodeFilter.FILTER_REJECT;
+      if (parent.closest(SKIP_SELECTOR)) return NodeFilter.FILTER_REJECT;
+      const text = (node.nodeValue || '').trim();
+      if (!text) return NodeFilter.FILTER_REJECT;
+      const rect = parent.getBoundingClientRect();
+      if (!rect.width || !rect.height) return NodeFilter.FILTER_REJECT;
+      if (rect.bottom < 0 || rect.top > window.innerHeight) return NodeFilter.FILTER_REJECT;
+      return NodeFilter.FILTER_ACCEPT;
+    },
+  });
+
+  let node;
+  while ((node = walker.nextNode())) {
+    const text = (node.nodeValue || '').trim();
+    if (!text) continue;
+    parts.push(text);
+    total += text.length + 1;
+    if (total >= limit) break;
+  }
+  return parts.join(' ').slice(0, limit);
+}
+
+function nearestHeading() {
+  const headings = Array.from(document.querySelectorAll('h1, h2, h3'));
+  let best = '';
+  for (const h of headings) {
+    const rect = h.getBoundingClientRect();
+    if (rect.bottom <= 0 || isInWidget(h)) continue;
+    const text = (h.innerText || h.textContent || '').trim();
+    if (text) { best = text; break; }
+  }
+  return best;
+}
+
+function getQuestionContext() {
+  const title = document.title;
+  const url = location.href;
+  const selection = currentSelection();
+
+  if (selection) {
+    return {
+      source: 'selection',
+      label: 'selection',
+      question_text: selection.slice(0, MAX_QUESTION_CHARS),
+      options: [],
+      context_text: viewportText(MAX_CONTEXT_CHARS),
+      page_title: title,
+      url,
+    };
+  }
+
+  const mcq = detectMCQGroup();
+  if (mcq) {
+    return {
+      source: 'mcq',
+      label: 'detected question',
+      question_text: mcq.questionText.slice(0, MAX_QUESTION_CHARS),
+      options: mcq.options,
+      context_text: mcq.questionText.slice(0, MAX_CONTEXT_CHARS),
+      page_title: title,
+      url,
+    };
+  }
+
+  const visible = viewportText(MAX_VISIBLE_CHARS);
+  const heading = nearestHeading();
+  const context = [heading, visible].filter(Boolean).join('\n\n');
+  return {
+    source: 'visible',
+    label: 'visible text',
+    question_text: visible.slice(0, MAX_QUESTION_CHARS),
+    options: [],
+    context_text: context.slice(0, MAX_CONTEXT_CHARS),
+    page_title: title,
+    url,
+  };
 }
 
 function getPageText() {
-  const parts = [];
-  try {
-    const main = document.querySelector('main') || document.querySelector('#root') || document.body;
-    parts.push(main.innerText || '');
-  } catch (e) { /* ignore */ }
+  const root = document.querySelector('main') || document.querySelector('#root') || document.body;
+  if (!root) return '';
+
+  let text = '';
+  let clone = null;
+  try { clone = root.cloneNode(true); } catch (e) { clone = null; }
+
+  if (clone) {
+    clone.querySelectorAll('#alc-widget').forEach(el => el.remove());
+    clone.querySelectorAll('script, style, noscript, template, nav, footer, aside, [role="navigation"], [role="banner"]')
+      .forEach(el => el.remove());
+    text = (clone.innerText || clone.textContent || '').trim();
+  } else {
+    text = (root.innerText || '').trim();
+  }
+
+  const parts = [text];
   document.querySelectorAll('iframe').forEach(f => {
     try {
-      parts.push(f.contentDocument.body.innerText || '');
+      const doc = f.contentDocument;
+      if (doc && doc.body) {
+        const t = (doc.body.innerText || '').trim();
+        if (t) parts.push(t);
+      }
     } catch (e) { /* cross-origin, ignore */ }
   });
-  return parts.join('\n');
+  return parts.filter(Boolean).join('\n');
 }
 
 function guessLanguage(el) {

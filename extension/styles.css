@@ -261,6 +261,140 @@
   margin: 8px 0;
 }
 
+/* --- chat: messages, chips, markdown (ALC patch 3) --- */
+
+.alc-chat-placeholder {
+  text-align: center;
+  color: var(--alc-text-muted);
+  padding: 20px;
+  font-size: 13px;
+}
+
+.alc-msg { margin: 4px 0; display: flex; }
+.alc-msg-user { justify-content: flex-end; }
+.alc-msg-assistant { justify-content: flex-start; }
+
+.alc-bubble {
+  font-size: 13px;
+  line-height: 1.55;
+  max-width: 85%;
+  word-break: break-word;
+}
+
+.alc-bubble-user {
+  padding: 6px 12px;
+  border-radius: 12px 12px 4px 12px;
+  background: var(--alc-primary);
+  color: #fff;
+}
+
+.alc-bubble-assistant {
+  padding: 6px 12px;
+  border-radius: 12px 12px 12px 4px;
+  background: var(--alc-bg-alt);
+  border: 1px solid var(--alc-border);
+  white-space: pre-wrap;
+}
+
+.alc-bubble-assistant h4 {
+  color: var(--alc-primary);
+  margin: 8px 0 4px;
+  font-size: 13px;
+}
+
+.alc-bubble-assistant p { margin: 0 0 6px; }
+.alc-bubble-assistant ul,
+.alc-bubble-assistant ol { margin: 4px 0 6px; padding-left: 20px; }
+.alc-bubble-assistant li { margin: 2px 0; }
+
+.alc-bubble-assistant code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+  background: rgba(0,0,0,0.3);
+  padding: 1px 4px;
+  border-radius: 3px;
+}
+
+.alc-bubble-error {
+  padding: 8px 12px;
+  border-radius: 8px;
+  background: rgba(239,68,68,0.1);
+  border: 1px solid var(--alc-error);
+  color: var(--alc-error);
+}
+
+.alc-bubble-interrupted {
+  padding: 6px 12px;
+  border-radius: 12px 12px 12px 4px;
+  background: rgba(234,179,8,0.1);
+  border: 1px solid var(--alc-warning);
+  color: var(--alc-text-muted);
+  white-space: pre-wrap;
+}
+
+.alc-offline-cmd {
+  display: block;
+  margin-top: 6px;
+  padding: 6px 8px;
+  border-radius: 6px;
+  background: rgba(0,0,0,0.35);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+  color: var(--alc-text);
+  white-space: pre-wrap;
+}
+
+.alc-code {
+  position: relative;
+  margin: 6px 0;
+}
+
+.alc-code pre {
+  margin: 0;
+  padding: 8px 10px;
+  border-radius: 6px;
+  background: rgba(0,0,0,0.35);
+  border: 1px solid var(--alc-border);
+  overflow-x: auto;
+}
+
+.alc-code code {
+  background: none;
+  padding: 0;
+  font-size: 12px;
+  white-space: pre;
+}
+
+.alc-copy {
+  position: absolute;
+  top: 4px;
+  right: 4px;
+  padding: 2px 8px;
+  border-radius: 4px;
+  border: 1px solid var(--alc-border);
+  background: var(--alc-bg);
+  color: var(--alc-text-muted);
+  font-size: 10px;
+  cursor: pointer;
+}
+
+.alc-copy:hover { color: var(--alc-text); border-color: var(--alc-primary); }
+
+.alc-chip {
+  padding: 4px 9px;
+  border-radius: 12px;
+  border: 1px solid var(--alc-border);
+  background: var(--alc-bg-alt);
+  color: var(--alc-text-muted);
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.alc-chip:hover {
+  color: var(--alc-text);
+  border-color: var(--alc-primary);
+}
+
 /* Capture source banner, preview toggle and captured-text preview (Spec A) */
 .alc-capture {
   display: flex;

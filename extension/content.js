@@ -4,7 +4,6 @@ const API_BASE = 'http://localhost:8000';
 const MAX_QUESTION_CHARS = 2000;
 const MAX_CONTEXT_CHARS = 4000;
 const MAX_VISIBLE_CHARS = 3000;
-const MAX_PAGE_CHARS = 12000;
 // Full cleaned page text for mcq-explain when no options were detected.
 // Must match EXTENSION_MAX_CONTEXT in backend/app/api/routes/extension.py.
 const MAX_PAGE_CONTEXT_CHARS = 60000;
@@ -75,9 +74,15 @@ const html = `
       </div>
       <div id="alc-chat-view" style="display:none;flex-direction:column;height:100%;">
         <div id="alc-chat-messages" style="flex:1;overflow-y:auto;padding:8px 0;min-height:300px;max-height:400px;"></div>
+        <div id="alc-chat-chips" style="display:flex;gap:6px;flex-wrap:wrap;padding-bottom:6px;">
+          <button class="alc-chip" type="button" data-q="Summarize this page">Summarize this page</button>
+          <button class="alc-chip" type="button" data-q="Explain the selected text">Explain selection</button>
+          <button class="alc-chip" type="button" data-q="Quiz me on this">Quiz me on this</button>
+        </div>
         <div style="display:flex;gap:8px;padding-top:8px;border-top:1px solid var(--alc-border);">
           <input id="alc-chat-input" type="text" placeholder="Ask about this page..." style="flex:1;padding:8px 12px;border-radius:8px;border:1px solid var(--alc-border);background:var(--alc-bg-alt);color:var(--alc-text);font-size:13px;outline:none;">
           <button id="alc-chat-clear" title="Clear chat" style="padding:8px 10px;border-radius:8px;border:1px solid var(--alc-border);background:var(--alc-bg-alt);color:var(--alc-text-muted);cursor:pointer;font-size:13px;">↺</button>
+          <button id="alc-chat-stop" type="button" style="display:none;padding:8px 12px;border-radius:8px;border:1px solid var(--alc-error);background:rgba(239,68,68,0.12);color:var(--alc-error);cursor:pointer;font-weight:600;font-size:13px;">Stop</button>
           <button id="alc-chat-send" style="padding:8px 16px;border-radius:8px;border:none;background:var(--alc-primary);color:white;cursor:pointer;font-weight:600;">Send</button>
         </div>
       </div>
@@ -91,6 +96,13 @@ const html = `
 
 let chatHistory = [];
 let chatInitialized = false;
+let chatPlaceholderNode = null;
+let streamRunId = 0;
+let chatAbort = null;
+let streaming = false;
+let lastPageVersion = { url: '', hash: '' };
+let chatKey = '';
+const historyStore = new Map();
 let lastUrl = location.href;
 let mutationTimer = null;
 let lastSelection = { text: '', ts: 0 };
@@ -122,8 +134,22 @@ function injectWidget() {
   document.getElementById('alc-tab-tools').onclick = () => switchTab('tools');
   document.getElementById('alc-tab-chat').onclick = () => switchTab('chat');
   document.getElementById('alc-chat-send').onclick = sendChatMessage;
-  document.getElementById('alc-chat-clear').onclick = () => resetChat(false);
-  document.getElementById('alc-chat-input').onkeydown = (e) => { if (e.key === 'Enter') sendChatMessage(); };
+  document.getElementById('alc-chat-stop').onclick = stopStreaming;
+  document.getElementById('alc-chat-clear').onclick = () => resetChat(true);
+  document.getElementById('alc-chat-input').onkeydown = (e) => {
+    if (e.key !== 'Enter') return;
+    if (streaming) { e.preventDefault(); return; }
+    sendChatMessage();
+  };
+  document.querySelectorAll('.alc-chip[data-q]').forEach(chip => {
+    chip.onclick = () => {
+      if (streaming) return;
+      const chatInput = document.getElementById('alc-chat-input');
+      if (!chatInput) return;
+      chatInput.value = chip.dataset.q;
+      chatInput.focus();
+    };
+  });
 
   document.querySelectorAll('.alc-tool-btn[data-action]').forEach(btn => {
     btn.onclick = () => doAction(btn.dataset.action);
@@ -806,8 +832,13 @@ function checkPage() {
     lastQuestionSignature = fingerprint;
   }
 
-  chatHistory = [];
+  // Abort anything in flight so late deltas cannot land in the new chat.
+  stopStreaming();
+  forgetCurrentChat();
   chatInitialized = false;
+  removePlaceholder();
+  const msgContainer = getChatContainer();
+  if (msgContainer) msgContainer.innerHTML = '';
   if (input) input.value = '';
 
   showChatNotice(
@@ -818,20 +849,35 @@ function checkPage() {
 }
 
 function resetChat(showMsg) {
-  chatHistory = [];
+  stopStreaming();
+  forgetCurrentChat();
   chatInitialized = false;
-  const msgContainer = document.getElementById('alc-chat-messages');
+  removePlaceholder();
+  const msgContainer = getChatContainer();
   if (!msgContainer) return;
-  const panel = document.getElementById('alc-panel');
-  const chatOpen = panel && panel.classList.contains('open') &&
-    document.getElementById('alc-chat-view').style.display !== 'none';
-  if (showMsg && chatOpen) {
-    msgContainer.innerHTML = '<div style="text-align:center;color:var(--alc-text-muted);padding:20px;font-size:13px;">Chat cleared. Ask anything.</div>';
-  } else {
-    msgContainer.innerHTML = '';
-  }
+  msgContainer.innerHTML = '';
+  if (showMsg) showPlaceholder('Chat cleared. Ask anything.');
   const input = document.getElementById('alc-chat-input');
   if (input) input.value = '';
+}
+
+function renderHistory() {
+  const container = getChatContainer();
+  if (!container || container.children.length || !chatHistory.length) return false;
+  removePlaceholder();
+  for (const message of chatHistory) {
+    if (message.role === 'user') {
+      appendUserMessage(message.content);
+    } else {
+      const bubble = appendAssistantBubble();
+      if (bubble) {
+        bubble.innerHTML = renderMarkdown(message.content);
+        attachCopyButtons(bubble);
+      }
+    }
+  }
+  scrollChat();
+  return true;
 }
 
 function switchTab(tab) {
@@ -854,10 +900,9 @@ function switchTab(tab) {
     tabChat.style.color = 'var(--alc-primary)';
     tabTools.style.background = 'transparent';
     tabTools.style.color = 'var(--alc-text-muted)';
-    if (!chatInitialized) {
-      const msgContainer = document.getElementById('alc-chat-messages');
-      msgContainer.innerHTML = '<div style="text-align:center;color:var(--alc-text-muted);padding:20px;font-size:13px;">I can see this page. Ask any question about the lesson you\'re viewing.</div>';
-      chatInitialized = true;
+    syncChatKey();
+    if (!renderHistory() && !chatInitialized) {
+      showPlaceholder("I can see this page. Ask any question about the lesson you're viewing.");
     }
     setTimeout(() => document.getElementById('alc-chat-input').focus(), 100);
   }
@@ -1099,55 +1144,452 @@ function renderBadges(label, items, color) {
   return `<div class="alc-label">${label}</div><div>${items.map(i => `<span class="alc-badge ${color}">${escapeHtml(i)}</span>`).join('')}</div>`;
 }
 
+// --- chat: message helpers ------------------------------------------------
+
+const CHAT_MAX_MESSAGES = 12;
+const CHAT_MAX_CHARS = 8000;
+const CHAT_MAX_MESSAGE_CHARS = 4000;
+const CODE_INTENT_RE = /\b(code|write|implement|solve|solution|function|program|snippet|fix|syntax)\b/i;
+const OFFLINE_HINT = 'cd alc && make backend';
+
+function getChatContainer() {
+  return document.getElementById('alc-chat-messages');
+}
+
+function scrollChat() {
+  const container = getChatContainer();
+  if (container) container.scrollTop = container.scrollHeight;
+}
+
+function removePlaceholder() {
+  if (chatPlaceholderNode && chatPlaceholderNode.parentElement) {
+    chatPlaceholderNode.remove();
+  }
+  chatPlaceholderNode = null;
+}
+
+function showPlaceholder(text) {
+  const container = getChatContainer();
+  if (!container) return;
+  removePlaceholder();
+  const node = document.createElement('div');
+  node.className = 'alc-chat-placeholder';
+  node.dataset.placeholder = '1';
+  node.textContent = text;
+  container.appendChild(node);
+  chatPlaceholderNode = node;
+  chatInitialized = true;
+}
+
+function appendUserMessage(text) {
+  const container = getChatContainer();
+  if (!container) return;
+  const row = document.createElement('div');
+  row.className = 'alc-msg alc-msg-user';
+  const bubble = document.createElement('span');
+  bubble.className = 'alc-bubble alc-bubble-user';
+  bubble.textContent = text;
+  row.appendChild(bubble);
+  container.appendChild(row);
+}
+
+function appendAssistantBubble() {
+  const container = getChatContainer();
+  if (!container) return null;
+  const row = document.createElement('div');
+  row.className = 'alc-msg alc-msg-assistant';
+  const bubble = document.createElement('div');
+  bubble.className = 'alc-bubble alc-bubble-assistant';
+  row.appendChild(bubble);
+  container.appendChild(row);
+  return bubble;
+}
+
+function setStreaming(on) {
+  streaming = on;
+  const send = document.getElementById('alc-chat-send');
+  const stop = document.getElementById('alc-chat-stop');
+  if (send) send.disabled = on;
+  if (stop) stop.style.display = on ? 'inline-block' : 'none';
+}
+
+function stopStreaming() {
+  // Bump the run id first: any delta still in flight is no longer current.
+  streamRunId += 1;
+  if (chatAbort) {
+    try { chatAbort.abort(); } catch (e) { /* ignore */ }
+    chatAbort = null;
+  }
+  setStreaming(false);
+}
+
+// --- chat: history --------------------------------------------------------
+
+function currentChatKey() {
+  return `${location.href}|${lastQuestionSignature}`;
+}
+
+function boundedChatHistory() {
+  const clean = [];
+  for (const message of chatHistory) {
+    if (!message) continue;
+    if (message.role !== 'user' && message.role !== 'assistant') continue;
+    const content = String(message.content || '');
+    if (!content.trim()) continue;
+    clean.push({ role: message.role, content: content.slice(0, CHAT_MAX_MESSAGE_CHARS) });
+  }
+
+  const recent = clean.slice(-CHAT_MAX_MESSAGES);
+  const kept = [];
+  let total = 0;
+  for (let i = recent.length - 1; i >= 0; i--) {
+    total += recent[i].content.length;
+    if (total > CHAT_MAX_CHARS) break;
+    kept.unshift(recent[i]);
+  }
+  return kept;
+}
+
+function syncChatKey() {
+  const key = currentChatKey();
+  if (key === chatKey) return;
+  if (chatKey) historyStore.set(chatKey, chatHistory.slice());
+  chatKey = key;
+  chatHistory = (historyStore.get(key) || []).slice();
+}
+
+function forgetCurrentChat() {
+  if (chatKey) historyStore.delete(chatKey);
+  chatKey = '';
+  chatHistory = [];
+}
+
+// --- chat: markdown -------------------------------------------------------
+
+function inlineMarkdown(text) {
+  return text
+    .replace(/`([^`]+)`/g, '<code>$1</code>')
+    .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
+    .replace(/(^|[\s(])\*([^*\n]+)\*/g, '$1<em>$2</em>');
+}
+
+// Renders markdown to HTML. Input is escaped first, so no model output can
+// introduce markup; everything below only inserts tags we control.
+function renderMarkdown(raw) {
+  const lines = escapeHtml(String(raw || '')).split('\n');
+  const out = [];
+  let paragraph = [];
+  let listTag = null;
+  let inCode = false;
+  let codeLang = '';
+  let codeLines = [];
+
+  const flushParagraph = () => {
+    if (paragraph.length) {
+      out.push(`<p>${inlineMarkdown(paragraph.join(' '))}</p>`);
+      paragraph = [];
+    }
+  };
+  const flushList = () => {
+    if (listTag) { out.push(`</${listTag}>`); listTag = null; }
+  };
+  const flushCode = () => {
+    if (!inCode) return;
+    const lang = codeLang ? ` data-lang="${codeLang}"` : '';
+    out.push(
+      `<div class="alc-code"${lang}><button class="alc-copy" type="button">Copy</button>` +
+      `<pre><code>${codeLines.join('\n')}</code></pre></div>`
+    );
+    inCode = false;
+    codeLang = '';
+    codeLines = [];
+  };
+
+  for (const line of lines) {
+    const fence = line.match(/^\s*```\s*([\w+#-]*)\s*$/);
+    if (fence) {
+      if (inCode) {
+        flushCode();
+      } else {
+        flushParagraph();
+        flushList();
+        inCode = true;
+        codeLang = fence[1] || '';
+      }
+      continue;
+    }
+    if (inCode) { codeLines.push(line); continue; }
+
+    if (!line.trim()) { flushParagraph(); flushList(); continue; }
+
+    const heading = line.match(/^(#{1,4})\s+(.*)$/);
+    if (heading) {
+      flushParagraph();
+      flushList();
+      out.push(`<h4>${inlineMarkdown(heading[2])}</h4>`);
+      continue;
+    }
+
+    const bullet = line.match(/^\s*[-*+]\s+(.*)$/);
+    if (bullet) {
+      flushParagraph();
+      if (listTag !== 'ul') { flushList(); out.push('<ul>'); listTag = 'ul'; }
+      out.push(`<li>${inlineMarkdown(bullet[1])}</li>`);
+      continue;
+    }
+
+    const numbered = line.match(/^\s*\d+[.)]\s+(.*)$/);
+    if (numbered) {
+      flushParagraph();
+      if (listTag !== 'ol') { flushList(); out.push('<ol>'); listTag = 'ol'; }
+      out.push(`<li>${inlineMarkdown(numbered[1])}</li>`);
+      continue;
+    }
+
+    flushList();
+    paragraph.push(line.trim());
+  }
+
+  flushCode();
+  flushParagraph();
+  flushList();
+  return out.join('');
+}
+
+function attachCopyButtons(root) {
+  root.querySelectorAll('.alc-copy').forEach(button => {
+    button.onclick = async () => {
+      const code = button.parentElement && button.parentElement.querySelector('code');
+      try {
+        await navigator.clipboard.writeText(code ? code.textContent : '');
+        button.textContent = 'Copied';
+      } catch (e) {
+        button.textContent = 'Copy failed';
+      }
+      setTimeout(() => { button.textContent = 'Copy'; }, 1500);
+    };
+  });
+}
+
+// --- chat: request building ----------------------------------------------
+
+function computePageVersion() {
+  const text = getPageText(MAX_PAGE_CONTEXT_CHARS).slice(0, MAX_PAGE_CONTEXT_CHARS);
+  return { url: location.href, hash: hashString(text), text };
+}
+
+function buildPageAskPayload(question, forceContext, history) {
+  const payload = {
+    question,
+    history,
+    title: document.title,
+    url: location.href,
+  };
+
+  const selection = currentSelection();
+  if (selection) {
+    payload.selection = selection;
+  } else {
+    const version = computePageVersion();
+    const isNew = forceContext
+      || version.url !== lastPageVersion.url
+      || version.hash !== lastPageVersion.hash;
+    // Send the body only when the page changed; otherwise the backend can
+    // reuse its cache by hash.
+    if (isNew) {
+      payload.page_text = version.text;
+      lastPageVersion = { url: version.url, hash: version.hash };
+    }
+    payload.page_hash = version.hash;
+  }
+
+  if (CODE_INTENT_RE.test(question)) {
+    payload.code_intent = true;
+    const code = getCodeBlocks();
+    if (code) payload.code_context = code;
+  }
+
+  return payload;
+}
+
+// --- chat: streaming ------------------------------------------------------
+
+// Buffers SSE bytes until a blank line, so a `data:` payload split across
+// network chunks (or mid-UTF-8) is only dispatched once it is complete.
+function createSseParser(onChunk) {
+  let buffer = '';
+  return {
+    push(text) {
+      buffer += text;
+      let boundary;
+      while ((boundary = buffer.indexOf('\n\n')) !== -1) {
+        const chunk = buffer.slice(0, boundary);
+        buffer = buffer.slice(boundary + 2);
+        onChunk(chunk);
+      }
+    },
+    flush() {
+      const rest = buffer;
+      buffer = '';
+      if (rest.trim()) onChunk(rest);
+    },
+  };
+}
+
+function isStreamCurrent(run) {
+  return run === streamRunId;
+}
+
+async function streamAnswer(question, bubble, run, history) {
+  const controller = new AbortController();
+  chatAbort = controller;
+  let answer = '';
+  let resentContext = false;
+
+  const isCurrent = () => isStreamCurrent(run) && !controller.signal.aborted;
+  const paint = () => {
+    if (isCurrent() && bubble) bubble.textContent = answer;
+  };
+
+  for (;;) {
+    let response;
+    try {
+      response = await fetch(`${API_BASE}/api/page/ask`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(buildPageAskPayload(question, resentContext, history)),
+        signal: controller.signal,
+      });
+    } catch (e) {
+      if (controller.signal.aborted) return { aborted: true, answer };
+      return { offline: true, answer };
+    }
+
+    if (response.status === 409 && !resentContext) {
+      // The backend lost its cached page: resend the body and try once more.
+      resentContext = true;
+      lastPageVersion = { url: '', hash: '' };
+      continue;
+    }
+    if (!response.ok) {
+      const detail = await response.json().catch(() => ({}));
+      const message = response.status === 502 || /model failed/i.test(detail.detail || '')
+        ? 'Model failed, retry'
+        : `Request failed (${response.status})`;
+      return { error: message, answer };
+    }
+    if (!response.body || !response.body.getReader) {
+      return { error: 'Streaming unsupported in this browser', answer };
+    }
+
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let streamError = '';
+    let done = false;
+
+    const parser = createSseParser((chunk) => {
+      for (const line of chunk.split('\n')) {
+        if (!line.startsWith('data:')) continue;
+        const data = line.slice(5).trim();
+        if (!data) continue;
+        if (data === '[DONE]') { done = true; continue; }
+        let parsed;
+        try { parsed = JSON.parse(data); } catch (e) { continue; }
+        if (typeof parsed.delta === 'string' && parsed.delta) {
+          answer += parsed.delta;
+          paint();
+        } else if (parsed.error) {
+          streamError = String(parsed.error);
+        }
+      }
+    });
+
+    try {
+      while (!done) {
+        const { value, done: finished } = await reader.read();
+        if (finished) break;
+        // stream: true carries incomplete UTF-8 sequences across chunks.
+        parser.push(decoder.decode(value, { stream: true }));
+
+        if (!isCurrent()) {
+          try { await reader.cancel(); } catch (e) { /* ignore */ }
+          return { aborted: true, answer };
+        }
+      }
+
+      parser.push(decoder.decode());
+      parser.flush();
+    } catch (e) {
+      if (controller.signal.aborted) return { aborted: true, answer };
+      return { error: 'Stream interrupted', answer };
+    }
+
+    if (streamError) return { error: 'Model failed, retry', answer };
+    return { done: true, answer };
+  }
+}
+
+function renderOffline(bubble) {
+  bubble.className = 'alc-bubble alc-bubble-error';
+  bubble.innerHTML = '';
+  const label = document.createElement('div');
+  label.textContent = 'Backend offline. Start it with:';
+  const code = document.createElement('code');
+  code.className = 'alc-offline-cmd';
+  code.textContent = OFFLINE_HINT;
+  bubble.appendChild(label);
+  bubble.appendChild(code);
+}
+
+function renderErrorBubble(bubble, message) {
+  bubble.className = 'alc-bubble alc-bubble-error';
+  bubble.textContent = message;
+}
+
 async function sendChatMessage() {
+  if (streaming) return;
+
   const input = document.getElementById('alc-chat-input');
-  const msgContainer = document.getElementById('alc-chat-messages');
+  if (!input) return;
   const text = input.value.trim();
   if (!text) return;
 
+  syncChatKey();
+  removePlaceholder();
   input.value = '';
-  if (msgContainer.children.length === 1 && msgContainer.children[0].dataset.placeholder) {
-    msgContainer.innerHTML = '';
+
+  // Histories go up *before* this turn; the backend appends the question.
+  const history = boundedChatHistory();
+  chatHistory.push({ role: 'user', content: text });
+
+  appendUserMessage(text);
+  const bubble = appendAssistantBubble();
+  if (!bubble) return;
+  scrollChat();
+
+  const run = ++streamRunId;
+  setStreaming(true);
+
+  const result = await streamAnswer(text, bubble, run, history);
+
+  // A question/URL change or Stop supersedes this run; never touch the new
+  // conversation with a stale result.
+  if (run !== streamRunId) return;
+  setStreaming(false);
+
+  if (result.offline) { renderOffline(bubble); return; }
+  if (result.error) { renderErrorBubble(bubble, result.error); return; }
+  if (result.aborted) {
+    bubble.className = 'alc-bubble alc-bubble-interrupted';
+    bubble.textContent = `${result.answer || ''}${result.answer ? '\n\n' : ''}(stopped)`;
+    return;
   }
 
-  msgContainer.innerHTML += `<div style="text-align:right;margin:4px 0;"><span style="display:inline-block;padding:6px 12px;border-radius:12px 12px 4px 12px;background:var(--alc-primary);color:white;font-size:13px;max-width:80%;word-break:break-word;">${escapeHtml(text)}</span></div>`;
-
-  const loadingId = 'msg-' + Date.now();
-  msgContainer.innerHTML += `<div id="${loadingId}" style="text-align:left;margin:4px 0;"><span style="display:inline-block;padding:6px 12px;border-radius:12px 12px 12px 4px;background:var(--alc-bg-alt);border:1px solid var(--alc-border);font-size:13px;"><span class="alc-spinner"></span> Thinking...</span></div>`;
-  msgContainer.scrollTop = msgContainer.scrollHeight;
-
-  chatHistory.push({ role: "user", content: text });
-
-  const pageContext = getPageText().slice(0, MAX_PAGE_CHARS);
-  const codeIntent = /\b(code|write|implement|solve|solution|function|program|snippet|fix|syntax)\b/i.test(text);
-  const codeContext = codeIntent ? getCodeBlocks() : '';
-
-  try {
-    const res = await fetch(`${API_BASE}/api/extension/ask`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        action: 'chat',
-        text,
-        messages: chatHistory,
-        page_context: pageContext,
-        code_context: codeContext || undefined,
-        code_intent: codeIntent,
-      }),
-    });
-    if (!res.ok) throw new Error('Request failed');
-    const data = await res.json();
-    const reply = data.response || '(no response)';
-
-    document.getElementById(loadingId)?.remove();
-    msgContainer.innerHTML += `<div style="text-align:left;margin:4px 0;"><span style="display:inline-block;padding:6px 12px;border-radius:12px 12px 12px 4px;background:var(--alc-bg-alt);border:1px solid var(--alc-border);font-size:13px;max-width:80%;word-break:break-word;white-space:pre-wrap;">${escapeHtml(reply)}</span></div>`;
-    chatHistory.push({ role: "assistant", content: reply });
-    msgContainer.scrollTop = msgContainer.scrollHeight;
-  } catch (e) {
-    document.getElementById(loadingId)?.remove();
-    const errMsg = e.message.includes('fetch') ? 'Backend offline. Is the server running?' : e.message;
-    msgContainer.innerHTML += `<div style="text-align:left;margin:4px 0;"><span style="display:inline-block;padding:6px 12px;border-radius:12px;background:rgba(239,68,68,0.1);border:1px solid var(--alc-error);color:var(--alc-error);font-size:13px;">Error: ${escapeHtml(errMsg)}</span></div>`;
-  }
+  const reply = result.answer || '(no response)';
+  chatHistory.push({ role: 'assistant', content: reply });
+  bubble.innerHTML = renderMarkdown(reply);
+  attachCopyButtons(bubble);
+  scrollChat();
 }
 
 function init() {

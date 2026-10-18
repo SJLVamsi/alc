@@ -255,3 +255,60 @@ def test_explain_action_never_sends_code_context(load_page, stub_api):
     assert "code_context" not in calls[0]["body"]
 
 
+def test_question_fingerprint_tracks_detected_mcq(load_page):
+    quiz = load_page(MCQ_PAGE)
+    assert quiz.evaluate("questionFingerprint()").startswith("mcq:")
+
+    plain = load_page(PLAIN_PAGE)
+    assert plain.evaluate("questionFingerprint()") == ""
+
+
+def test_widget_mutations_are_ignored(load_page):
+    page = load_page(PLAIN_PAGE)
+    assert page.evaluate(
+        "isWidgetMutation({ target: document.getElementById('alc-toggle') })"
+    ) is True
+    assert page.evaluate(
+        "isWidgetMutation({ target: document.body })"
+    ) is False
+
+
+def test_ordinary_page_change_keeps_chat_history(load_page):
+    page = load_page(PLAIN_PAGE)
+    page.evaluate("""
+        chatHistory = [{role: 'user', content: 'keep me'}];
+        lastUrl = location.href;
+        lastQuestionSignature = '';
+    """)
+    page.evaluate("checkPage()")
+
+    assert page.evaluate("chatHistory.length") == 1
+    assert page.evaluate("document.querySelectorAll('.alc-chat-notice').length") == 0
+
+
+def test_detected_question_change_resets_chat_with_notice(load_page):
+    page = load_page(MCQ_PAGE)
+    page.evaluate("""
+        chatHistory = [{role: 'user', content: 'stale'}];
+        lastUrl = location.href;
+        lastQuestionSignature = 'stale-signature';
+    """)
+    page.evaluate("checkPage()")
+
+    assert page.evaluate("chatHistory.length") == 0
+    assert "New question detected" in page.inner_text(".alc-chat-notice")
+
+
+def test_url_change_resets_chat_with_notice(load_page):
+    page = load_page(PLAIN_PAGE)
+    page.evaluate("""
+        chatHistory = [{role: 'user', content: 'old page'}];
+        lastUrl = 'https://example.com/somewhere-else';
+    """)
+    page.evaluate("checkPage()")
+
+    assert page.evaluate("chatHistory.length") == 0
+    assert "New page detected" in page.inner_text(".alc-chat-notice")
+
+
+

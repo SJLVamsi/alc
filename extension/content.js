@@ -75,7 +75,6 @@ const html = `
 let chatHistory = [];
 let chatInitialized = false;
 let lastUrl = location.href;
-let lastPageHash = '';
 let mutationTimer = null;
 let lastSelection = { text: '', ts: 0 };
 let lastQuestionSignature = '';
@@ -498,70 +497,85 @@ function getCodeBlocks() {
   return parts.join('\n\n');
 }
 
-function pageHash() {
+function hashString(text) {
   let hash = 0;
-  const sample = getPageText().slice(0, 4000);
-  for (let i = 0; i < sample.length; i++) {
-    hash = ((hash << 5) - hash) + sample.charCodeAt(i);
+  for (let i = 0; i < text.length; i++) {
+    hash = ((hash << 5) - hash) + text.charCodeAt(i);
     hash |= 0;
   }
-  return hash;
+  return String(hash);
+}
+
+// Cheap fingerprint of whatever the panel would currently act on: the live
+// selection, else the detected MCQ. Deliberately avoids the viewport walk so
+// it stays affordable on every debounced mutation.
+function questionFingerprint() {
+  const sel = currentSelection();
+  if (sel) return `sel:${hashString(sel)}`;
+  const mcq = detectMCQGroup();
+  if (mcq) return `mcq:${hashString(mcq.questionText)}`;
+  return '';
+}
+
+function isWidgetMutation(mutation) {
+  return isInWidget(mutation.target);
 }
 
 function startPageWatcher() {
   const origPushState = history.pushState;
   history.pushState = function (...args) {
     const r = origPushState.apply(this, args);
-    setTimeout(() => onPageChanged(true), 200);
+    setTimeout(checkPage, 200);
     return r;
   };
-  window.addEventListener('popstate', () => setTimeout(() => onPageChanged(true), 200));
+  window.addEventListener('popstate', () => setTimeout(checkPage, 200));
 
-  new MutationObserver(() => {
-    if (mutationTimer) return;
+  new MutationObserver((mutations) => {
+    // The widget animates and re-renders constantly; never let it trigger us.
+    if (mutations.length && mutations.every(isWidgetMutation)) return;
+    if (mutationTimer) clearTimeout(mutationTimer);
     mutationTimer = setTimeout(() => {
       mutationTimer = null;
-      const hash = pageHash();
-      if (hash !== lastPageHash) {
-        lastPageHash = hash;
-        onPageChanged(false);
-      }
-    }, 700);
-  }).observe(document.body, { childList: true, subtree: true });
-
-  setInterval(() => {
-    const hash = pageHash();
-    if (hash !== lastPageHash) {
-      lastPageHash = hash;
-      onPageChanged(false);
-    }
-  }, 3000);
+      checkPage();
+    }, 1500);
+  }).observe(document.body, { childList: true, subtree: true, characterData: true });
 }
 
-function onPageChanged(isUrlChange) {
+function showChatNotice(text) {
+  const msgContainer = document.getElementById('alc-chat-messages');
+  if (!msgContainer) return;
+  msgContainer.innerHTML = '';
+  const notice = document.createElement('div');
+  notice.className = 'alc-chat-notice';
+  notice.textContent = text;
+  msgContainer.appendChild(notice);
+  chatInitialized = true;
+}
+
+function checkPage() {
   const urlChanged = location.href !== lastUrl;
-  if (urlChanged) {
-    lastUrl = location.href;
-  }
+  if (urlChanged) lastUrl = location.href;
+
+  const fingerprint = questionFingerprint();
+  const questionChanged = !!fingerprint && fingerprint !== lastQuestionSignature;
+  if (questionChanged) lastQuestionSignature = fingerprint;
+
+  // Ordinary page churn is not a reason to throw away the conversation.
+  if (!urlChanged && !questionChanged) return;
+
   const input = document.getElementById('alc-chat-input');
-  const isTyping = input && document.activeElement === input && input.value.trim();
-  if (isTyping) return;
+  if (input && document.activeElement === input && input.value.trim()) return;
 
   chatHistory = [];
   chatInitialized = false;
-  const msgContainer = document.getElementById('alc-chat-messages');
-  if (!msgContainer) return;
-  const panel = document.getElementById('alc-panel');
-  const chatOpen = panel && panel.classList.contains('open') &&
-    document.getElementById('alc-chat-view').style.display !== 'none';
+  const chatInput = document.getElementById('alc-chat-input');
+  if (chatInput) chatInput.value = '';
 
-  if (chatOpen) {
-    const label = urlChanged || isUrlChange ? 'New page detected — chat reset. Ask about this question.' : 'Page content changed — chat reset.';
-    msgContainer.innerHTML = `<div style="text-align:center;color:var(--alc-text-muted);padding:20px;font-size:13px;">${label}</div>`;
-  } else {
-    msgContainer.innerHTML = '';
-  }
-  if (input) input.value = '';
+  showChatNotice(
+    urlChanged
+      ? 'New page detected — ask about this question.'
+      : 'New question detected — chat reset.'
+  );
 }
 
 function resetChat(showMsg) {

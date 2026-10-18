@@ -9,6 +9,10 @@ from app.core.exceptions import LLMError
 
 router = APIRouter(prefix="/api/extension", tags=["extension"])
 
+# Generous ceiling for page text handed to the MCQ explainer; it cuts its own
+# bounded stem+options region out of this.
+EXTENSION_MAX_CONTEXT = 60000
+
 
 class ExtensionRequest(BaseModel):
     action: str
@@ -66,9 +70,11 @@ Provide a clear, concise explanation with examples where helpful."""
 
         elif req.action == "mcq-explain":
             # The explainer owns the whole decision: supplied options, then
-            # regex over the captured region, then a bounded model call.
+            # regex over the full page text, then a bounded model call. It is
+            # handed a generous slice and cuts its own stem+options region, so
+            # a question far down a long page is still reachable.
             result = await mcq_explainer.extract_question(
-                page_text=(req.context or req.text or "")[:6000],
+                page_text=(req.context or req.text or "")[:EXTENSION_MAX_CONTEXT],
                 question_text=(req.text or "")[:2000],
                 options=req.options,
             )

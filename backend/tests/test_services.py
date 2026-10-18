@@ -96,8 +96,107 @@ class TestMCQExplainer:
         options, _ = find_option_run("Pick one\n(a) alpha\n(b) beta\n(c) gamma")
         assert [o["text"] for o in options] == ["alpha", "beta", "gamma"]
 
-        options, _ = find_option_run("Pick one\n1. one\n2. two\n3. three")
+        # a numeric list is only trusted directly under a question
+        options, _ = find_option_run("Which one is first?\n1. one\n2. two\n3. three")
         assert [o["text"] for o in options] == ["one", "two", "three"]
+
+    def test_numbered_nav_does_not_beat_lettered_options(self):
+        from app.services.mcq_explainer import find_option_run
+
+        page = "\n".join([
+            "Course home",
+            "1. Introduction",
+            "2. Setup",
+            "3. Variables",
+            "Which keyword declares a constant?",
+            "A) let",
+            "B) const",
+        ])
+        options, _ = find_option_run(page)
+        assert [o["text"] for o in options] == ["let", "const"]
+
+    def test_letter_run_wins_even_when_numeric_run_is_longer(self):
+        from app.services.mcq_explainer import find_option_run
+
+        page = "\n".join([
+            "Which one is correct?",
+            "1. a", "2. b", "3. c", "4. d", "5. e",
+            "Now pick from these",
+            "A) yes",
+            "B) no",
+        ])
+        options, _ = find_option_run(page)
+        assert [o["text"] for o in options] == ["yes", "no"]
+
+    def test_numeric_list_without_a_question_is_ignored(self):
+        from app.services.mcq_explainer import find_option_run
+
+        options, _ = find_option_run("Shopping list\n1. milk\n2. bread\n3. eggs")
+        assert options == []
+
+    def test_picks_letter_run_closest_after_the_last_question(self):
+        from app.services.mcq_explainer import find_option_run
+
+        page = "\n".join([
+            "Q1) First question?",
+            "A) alpha",
+            "B) beta",
+            "Q2) Second question?",
+            "A) gamma",
+            "B) delta",
+        ])
+        options, _ = find_option_run(page)
+        assert [o["text"] for o in options] == ["gamma", "delta"]
+
+    def test_finds_mcq_far_down_a_long_page(self):
+        from app.services.mcq_explainer import find_option_run
+
+        filler = "\n".join(f"filler line {i} with a few ordinary words" for i in range(700))
+        assert len(filler) > 20000
+        page = filler + "\nWhich structure is FIFO?\nA. Stack\nB. Queue\n"
+
+        options, stem = find_option_run(page)
+        assert [o["text"] for o in options] == ["Stack", "Queue"]
+        assert "FIFO" in stem
+        assert page.index("FIFO") > 20000
+
+    @pytest.mark.asyncio
+    async def test_no_mcq_at_all_raises(self):
+        from app.core.exceptions import LLMError
+        from app.services.mcq_explainer import MCQExplainer
+
+        mcq = MCQExplainer()
+        with patch(
+            "app.services.mcq_explainer.generate_json",
+            side_effect=AssertionError("must not ask the model without a question"),
+        ):
+            with pytest.raises(LLMError):
+                await mcq.extract_question(page_text="Just prose about trees.")
+
+    @pytest.mark.asyncio
+    async def test_model_fallback_gets_the_region_not_the_page_head(self):
+        from app.services.mcq_explainer import MCQExplainer
+
+        filler = "\n".join(f"filler {i} words words words" for i in range(400))
+        page = filler + "\nWhich structure is FIFO?\nThe first one in is first out."
+
+        captured = {}
+
+        async def fake_generate_json(prompt, required_fields=(), **kwargs):
+            captured["prompt"] = prompt
+            return {
+                "question_text": "Which structure is FIFO?",
+                "options": [{"label": "A", "text": "Stack"}, {"label": "B", "text": "Queue"}],
+            }
+
+        mcq = MCQExplainer()
+        with patch("app.services.mcq_explainer.generate_json", new=fake_generate_json):
+            result = await mcq.extract_question(page_text=page)
+
+        assert result["source"] == "model"
+        assert "FIFO" in captured["prompt"]
+        assert "filler 0 words" not in captured["prompt"]
+        assert len(captured["prompt"]) < 4500
 
     @pytest.mark.asyncio
     async def test_never_defaults_to_option_a_when_model_fails(self):

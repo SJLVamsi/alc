@@ -10,11 +10,19 @@ OPTION_MARKER_RE = re.compile(
     r"^[\s>*\u2022\-\u2013]*\(?([A-Za-z]|\d{1,2})[.)]\s*(\S.*?)\s*$"
 )
 
+# A line that reads like the start of a question: ends in '?' or opens with
+# Q / Q1 / Question.
+QUESTION_START_RE = re.compile(r"^\s*\(?(?:Q\d*|Question)\b", re.IGNORECASE)
+
 MAX_REGION_CHARS = 4000
 MAX_STEM_CHARS = 1200
 MAX_OPTION_CHARS = 300
 MAX_OPTIONS = 26
 MAX_GAP_LINES = 8
+# A numeric list is only trusted as an option list this soon after a question.
+NUMERIC_QUESTION_WINDOW = 3
+# How much of the page after a question line to hand the model.
+REGION_WINDOW_LINES = 40
 
 
 def label_for(index: int) -> str:
@@ -29,7 +37,7 @@ def normalize_options(options) -> list[dict]:
     identifiers regardless of how the page numbered things.
     """
     out: list[dict] = []
-    for index, option in enumerate(options or []):
+    for option in options or []:
         if isinstance(option, dict):
             text = str(option.get("text", "")).strip()
         else:
@@ -42,33 +50,78 @@ def normalize_options(options) -> list[dict]:
     return out
 
 
-def _marker_rank(marker: str) -> Optional[int]:
-    value = marker.strip().upper()
+def _marker_kind(marker: str) -> tuple[Optional[str], Optional[int]]:
+    """Classify a marker as ('letter', rank) or ('numeric', rank)."""
+    value = marker.strip()
     if len(value) == 1 and value.isalpha():
-        return ord(value) - ord("A") + 1
-    if value.isdigit() and int(value) > 0:
-        return int(value)
-    return None
+        return "letter", ord(value.upper()) - ord("A") + 1
+    if value.isdigit() and 0 < int(value) <= 99:
+        return "numeric", int(value)
+    return None, None
 
 
-def _best_run(hits: list[dict]) -> list[dict]:
-    """Longest run of consecutive markers (A,B,C / 1,2,3) with no big gaps."""
+def _is_question_like(line: str) -> bool:
+    stripped = line.strip()
+    if not stripped:
+        return False
+    if stripped.endswith("?"):
+        return True
+    return bool(QUESTION_START_RE.match(stripped))
+
+
+def _collect_hits(lines: list[str]) -> list[dict]:
+    hits = []
+    for index, line in enumerate(lines):
+        match = OPTION_MARKER_RE.match(line)
+        if not match:
+            continue
+        kind, rank = _marker_kind(match.group(1))
+        text = match.group(2).strip()
+        if kind is None or not text:
+            continue
+        hits.append({"line": index, "rank": rank, "kind": kind, "text": text})
+    return hits
+
+
+def _runs(hits: list[dict], kind: str) -> list[list[dict]]:
+    """Every run of >=2 consecutive ranks of one marker kind."""
+    filtered = [hit for hit in hits if hit["kind"] == kind]
     runs = []
-    for index, start in enumerate(hits):
+    for index, start in enumerate(filtered):
         sequence = [start]
-        for candidate in hits[index + 1:]:
+        for candidate in filtered[index + 1:]:
             previous = sequence[-1]
             consecutive = candidate["rank"] == previous["rank"] + 1
             close_enough = candidate["line"] - previous["line"] <= MAX_GAP_LINES
             if consecutive and close_enough:
                 sequence.append(candidate)
-        runs.append(sequence)
+        if len(sequence) >= 2:
+            runs.append(sequence)
+    return runs
 
+
+def _numeric_eligible(run: list[dict], question_lines: list[int]) -> bool:
+    """A numeric list only counts as options when a question sits just above it.
+
+    Numbered lists are everywhere in page chrome; requiring a question line
+    within a few lines of the first number keeps nav out of the options.
+    """
+    start = run[0]["line"]
+    return any(0 <= start - q <= NUMERIC_QUESTION_WINDOW for q in question_lines)
+
+
+def _select_run(runs: list[list[dict]], last_question_line: Optional[int]) -> list[dict]:
     if not runs:
         return []
-    # Longest wins; prefer a run starting at A/1; then the later one.
-    runs.sort(key=lambda run: (len(run), run[0]["rank"] == 1, run[0]["line"]))
-    return runs[-1]
+
+    def score(run: list[dict]):
+        start = run[0]["line"]
+        if last_question_line is not None and start > last_question_line:
+            # Nearest run after the last question wins.
+            return (0, start - last_question_line, -len(run))
+        return (1, 0, -len(run))
+
+    return min(runs, key=score)
 
 
 def _stem_before(lines: list[str], first_option_line: int) -> str:
@@ -85,37 +138,74 @@ def _stem_before(lines: list[str], first_option_line: int) -> str:
     return "\n".join(collected)[-MAX_STEM_CHARS:]
 
 
+def _locate_run(lines: list[str]) -> tuple[list[dict], list[str]]:
+    """Best option run over the whole text, as (hits, option texts).
+
+    Lettered markers always win: if any letter run exists we never look at
+    numbered lists, and a numbered list is only considered when a question
+    line sits within a few lines above it.
+    """
+    hits = _collect_hits(lines)
+    if not hits:
+        return [], []
+
+    question_lines = [i for i, line in enumerate(lines) if _is_question_like(line)]
+    last_question_line = question_lines[-1] if question_lines else None
+
+    run = _select_run(_runs(hits, "letter"), last_question_line)
+    if not run:
+        numeric = [r for r in _runs(hits, "numeric") if _numeric_eligible(r, question_lines)]
+        run = _select_run(numeric, last_question_line)
+
+    if len(run) < 2:
+        return [], []
+    return run, [hit["text"][:MAX_OPTION_CHARS] for hit in run]
+
+
 def find_option_run(page_text: str) -> tuple[list[dict], str]:
     """Pull an option list out of raw page text without asking the model.
 
-    Returns (options, stem). Empty options when nothing looked like a choice
-    list. Only the region around the markers is ever used, never the whole
-    page.
+    Scans the whole text, so a question far down a long page is still found.
+    Returns (options, stem); empty options when nothing looked like a choice
+    list.
     """
-    if not page_text:
+    lines = (page_text or "").splitlines()
+    if not lines:
         return [], ""
 
-    lines = page_text.splitlines()
-    hits = []
-    for index, line in enumerate(lines):
-        match = OPTION_MARKER_RE.match(line)
-        if not match:
-            continue
-        rank = _marker_rank(match.group(1))
-        text = match.group(2).strip()
-        if rank is None or not text:
-            continue
-        hits.append({"line": index, "rank": rank, "text": text})
-
-    run = _best_run(hits)
+    run, texts = _locate_run(lines)
     if len(run) < 2:
         return [], ""
 
     options = [
-        {"label": label_for(i), "text": hit["text"][:MAX_OPTION_CHARS]}
-        for i, hit in enumerate(run[:MAX_OPTIONS])
+        {"label": label_for(i), "text": text}
+        for i, text in enumerate(texts[:MAX_OPTIONS])
     ]
     return options, _stem_before(lines, run[0]["line"])
+
+
+def bounded_region(page_text: str, max_chars: int = MAX_REGION_CHARS) -> str:
+    """The stem+options region, or a window after the last question line.
+
+    Never returns the head of the page: the interesting text is wherever the
+    question is, which on a long lesson page may be tens of thousands of
+    characters in. Returns "" when the page shows no question signal at all.
+    """
+    lines = (page_text or "").splitlines()
+    if not lines:
+        return ""
+
+    run, texts = _locate_run(lines)
+    if run:
+        stem = _stem_before(lines, run[0]["line"])
+        listed = "\n".join(f"{label_for(i)}. {text}" for i, text in enumerate(texts))
+        return f"{stem}\n{listed}".strip()[:max_chars]
+
+    question_lines = [i for i, line in enumerate(lines) if _is_question_like(line)]
+    if not question_lines:
+        return ""
+    start = question_lines[-1]
+    return "\n".join(lines[start:start + REGION_WINDOW_LINES]).strip()[:max_chars]
 
 
 def _extraction_prompt(region: str) -> str:
@@ -162,8 +252,8 @@ class MCQExplainer:
         """Resolve {question_text, options} from whatever the caller has.
 
         Order of preference: options the caller already scraped, then options
-        found by regex in the page text, then a bounded model call over the
-        captured stem. Raises LLMError rather than guessing.
+        found by regex anywhere in the page text, then a bounded model call
+        over the stem+options region. Raises LLMError rather than guessing.
         """
         supplied = normalize_options(options)
         if len(supplied) >= 2:
@@ -178,9 +268,10 @@ class MCQExplainer:
                 "source": "regex",
             }
 
-        # Nothing looked like an option list. Ask the model, but only about the
-        # bounded stem we captured - not the first N chars of the whole page.
-        region = (question_text or page_text or "").strip()[:MAX_REGION_CHARS]
+        region = bounded_region(page_text or "")
+        if not region:
+            # A DOM-captured stem is still a usable bounded region.
+            region = (question_text or "").strip()[:MAX_REGION_CHARS]
         if not region:
             raise LLMError("no multiple choice question found on the page")
 

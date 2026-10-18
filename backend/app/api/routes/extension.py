@@ -5,6 +5,7 @@ from app.services.llm_client import llm_client
 from app.services.coding_assistant import coding_assistant
 from app.services.mcq_explainer import mcq_explainer
 from app.core.logging import logger
+from app.core.exceptions import LLMError
 
 router = APIRouter(prefix="/api/extension", tags=["extension"])
 
@@ -19,18 +20,6 @@ class ExtensionRequest(BaseModel):
     options: Optional[list[str]] = None
     code_context: Optional[str] = None
     code_intent: Optional[bool] = False
-
-
-def _normalize_options(options: list[str]) -> list[dict]:
-    """DOM-extracted option strings -> the [{label, text}] the service expects.
-
-    Capped at 26 (A-Z): a mis-detected option group shouldn't flood the prompt.
-    """
-    return [
-        {"label": chr(ord("A") + i), "text": str(o).strip()}
-        for i, o in enumerate(options[:26])
-        if str(o).strip()
-    ]
 
 
 @router.post("/ask")
@@ -76,31 +65,22 @@ Provide a clear, concise explanation with examples where helpful."""
             return result
 
         elif req.action == "mcq-explain":
-            text = (req.text or req.context or "")[:6000]
-            normalized = _normalize_options(req.options or [])
-            if normalized:
-                # The page already told us the stem and options - skip the LLM
-                # extraction round-trip and go straight to the explanation.
-                explanation = await mcq_explainer.explain_question(text, normalized)
-                return {
-                    "question_text": text,
-                    "options": explanation.get("options", normalized),
-                    "suggested_answer": explanation.get("suggested_answer", ""),
-                    "overall_reasoning": explanation.get("overall_reasoning", ""),
-                }
-            result = await mcq_explainer.extract_question(text)
-            if not result.get("question_text"):
-                prompt = f"Find and explain the multiple choice question in this content:\n\n{text}"
-                resp = await llm_client.generate(prompt)
-                return {"response": resp}
+            # The explainer owns the whole decision: supplied options, then
+            # regex over the captured region, then a bounded model call.
+            result = await mcq_explainer.extract_question(
+                page_text=(req.context or req.text or "")[:6000],
+                question_text=(req.text or "")[:2000],
+                options=req.options,
+            )
             explanation = await mcq_explainer.explain_question(
-                result["question_text"], result.get("options", [])
+                result["question_text"], result["options"]
             )
             return {
                 "question_text": result["question_text"],
                 "options": explanation.get("options", []),
                 "suggested_answer": explanation.get("suggested_answer", ""),
                 "overall_reasoning": explanation.get("overall_reasoning", ""),
+                "capture_source": result.get("source", ""),
             }
 
         elif req.action == "generate-notes":
@@ -165,6 +145,11 @@ Provide a clear, concise explanation suitable for a student. Use examples if hel
         else:
             return {"error": f"Unknown action: {req.action}"}
 
+    except LLMError as e:
+        logger.error("extension_llm_failed", action=req.action, error=str(e))
+        raise HTTPException(status_code=502, detail="Model failed, retry")
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error("extension_request_failed", action=req.action, error=str(e))
         raise HTTPException(status_code=500, detail=str(e))

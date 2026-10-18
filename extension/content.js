@@ -792,7 +792,14 @@ async function doAction(action) {
         code_context: codeContext || undefined,
       }),
     });
-    if (!res.ok) throw new Error((await res.json().catch(() => ({}))).detail || 'Request failed');
+    if (!res.ok) {
+      const detail = (await res.json().catch(() => ({}))).detail || '';
+      // 502 is the backend's "the model produced nothing usable" signal.
+      if (res.status === 502 || /model failed/i.test(detail)) {
+        throw new Error('Model failed, retry');
+      }
+      throw new Error(detail || 'Request failed');
+    }
     const data = await res.json();
     renderResult(action, data, ctx);
   } catch (e) {

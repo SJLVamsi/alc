@@ -8,7 +8,7 @@ from app.config import settings
 from app.database import engine, Base
 from app.api.routes import (
     automation, courses, lessons, notes,
-    flashcards, coding, mcq, analytics, extension,
+    flashcards, coding, mcq, analytics, extension, page,
 )
 
 
@@ -29,10 +29,14 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
+    # "*" covers content-script fetches, which carry the host page's origin
+    # (chrome-extension://<id> and http://localhost:3000 included).
+    # No credentials are used, so a wildcard is a valid CORS response.
     allow_origins=["*"],
-    allow_credentials=True,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["*"],
 )
 
 
@@ -56,3 +60,4 @@ app.include_router(coding.router)
 app.include_router(mcq.router)
 app.include_router(analytics.router)
 app.include_router(extension.router)
+app.include_router(page.router)

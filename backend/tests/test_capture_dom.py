@@ -319,4 +319,208 @@ def test_url_change_resets_chat_with_notice(load_page):
     assert "New page detected" in page.inner_text(".alc-chat-notice")
 
 
+# --- patch 2: capture correctness ----------------------------------------
+
+STYLED_MCQ = """
+<html><head><title>Styled quiz</title></head><body>
+<div class="quiz">
+  <p class="stem">Which data structure is FIFO?</p>
+  <label class="opt"><input type="radio" name="q1" value="a" style="display:none"> A. Stack</label>
+  <label class="opt"><input type="radio" name="q1" value="b" style="display:none"> B. Queue</label>
+</div>
+</body></html>
+"""
+
+PARTLY_HIDDEN_MCQ = """
+<html><head><title>Partly hidden</title></head><body>
+<div class="quiz">
+  <p class="stem">Which data structure is FIFO?</p>
+  <label class="opt"><input type="radio" name="q1" value="a" style="display:none"> A. Stack</label>
+  <label class="opt"><input type="radio" name="q1" value="b" style="display:none"> B. Queue</label>
+  <label class="opt" style="display:none"><input type="radio" name="q1" value="c"> C. Hidden answer</label>
+</div>
+</body></html>
+"""
+
+HIDDEN_ANSWER_PAGE = """
+<html><head><title>Lesson</title></head><body>
+<main>
+  <h1>Recursion</h1>
+  <p id="visible">Recursion calls itself with a smaller input.</p>
+  <div style="display:none">Correct answer: B</div>
+  <div style="visibility:hidden">Also hidden: C</div>
+</main>
+</body></html>
+"""
+
+
+def test_hidden_input_with_visible_label_is_detected(load_page):
+    page = load_page(STYLED_MCQ)
+    ctx = page.evaluate("getQuestionContext()")
+
+    assert ctx["source"] == "mcq"
+    assert ctx["options"] == ["Stack", "Queue"]
+
+
+def test_hidden_option_is_dropped(load_page):
+    page = load_page(PARTLY_HIDDEN_MCQ)
+    ctx = page.evaluate("getQuestionContext()")
+
+    assert ctx["source"] == "mcq"
+    assert ctx["options"] == ["Stack", "Queue"]
+    assert "Hidden answer" not in ctx["question_text"]
+
+
+def test_hidden_text_is_excluded_from_page_text(load_page):
+    page = load_page(HIDDEN_ANSWER_PAGE)
+    text = page.evaluate("getPageText()")
+
+    assert "Recursion calls itself" in text
+    assert "Correct answer" not in text
+    assert "Also hidden" not in text
+
+
+def test_widget_text_is_excluded_from_page_text(load_page):
+    page = load_page(PLAIN_PAGE)
+    page.evaluate("""
+        document.getElementById('alc-widget')
+          .insertAdjacentHTML('beforeend', '<span>WIDGET_SENTINEL_XYZ</span>');
+    """)
+    text = page.evaluate("getPageText()")
+
+    assert "WIDGET_SENTINEL_XYZ" not in text
+    assert "Recursion is when a function calls itself" in text
+
+
+def test_widget_text_is_excluded_from_viewport_text(load_page):
+    page = load_page(PLAIN_PAGE)
+    page.evaluate("""
+        document.getElementById('alc-widget')
+          .insertAdjacentHTML('beforeend', '<span>WIDGET_SENTINEL_XYZ</span>');
+    """)
+    assert "WIDGET_SENTINEL_XYZ" not in page.evaluate("viewportText(3000)")
+
+
+def test_widget_options_are_not_detected(load_page):
+    page = load_page(PLAIN_PAGE)
+    page.evaluate("""
+        document.getElementById('alc-widget').insertAdjacentHTML('beforeend', `
+          <div class="options">
+            <span class="option">A. nope</span>
+            <span class="option">B. nope</span>
+          </div>`);
+    """)
+    assert page.evaluate("detectMCQGroup()") is None
+
+
+def test_selection_inside_widget_is_rejected(load_page):
+    page = load_page(PLAIN_PAGE)
+    page.evaluate("""
+        const range = document.createRange();
+        range.selectNodeContents(document.getElementById('alc-widget'));
+        const sel = window.getSelection();
+        sel.removeAllRanges();
+        sel.addRange(range);
+        document.dispatchEvent(new Event('mouseup'));
+    """)
+
+    assert page.evaluate("currentSelection()") == ""
+    assert page.evaluate("getQuestionContext().then(c => c.source)") == "visible"
+
+
+def test_widget_selection_does_not_overwrite_a_real_one(load_page):
+    page = load_page(PLAIN_PAGE)
+    page.evaluate("""
+        const sel = window.getSelection();
+        const real = document.createRange();
+        real.selectNodeContents(document.querySelector('#para'));
+        sel.removeAllRanges();
+        sel.addRange(real);
+        document.dispatchEvent(new Event('mouseup'));
+
+        const fake = document.createRange();
+        fake.selectNodeContents(document.getElementById('alc-widget'));
+        sel.removeAllRanges();
+        sel.addRange(fake);
+        document.dispatchEvent(new Event('mouseup'));
+    """)
+
+    assert "calls itself" in page.evaluate("currentSelection()")
+
+
+def test_option_group_off_to_the_right_is_not_detected(load_page):
+    page = load_page(MCQ_PAGE)
+    page.evaluate("""
+        const quiz = document.querySelector('.quiz');
+        quiz.style.position = 'absolute';
+        quiz.style.left = (window.innerWidth + 800) + 'px';
+        quiz.style.top = '40px';
+    """)
+
+    assert page.evaluate("detectMCQGroup()") is None
+
+
+def test_offscreen_right_element_is_not_in_viewport(load_page):
+    page = load_page(PLAIN_PAGE)
+    page.evaluate("""
+        const d = document.createElement('div');
+        d.id = 'offscreen';
+        d.textContent = 'OFFSCREEN RIGHT';
+        d.style.position = 'absolute';
+        d.style.left = (window.innerWidth + 500) + 'px';
+        d.style.top = '50px';
+        document.body.appendChild(d);
+    """)
+
+    assert page.evaluate("inViewport(document.getElementById('offscreen'))") is False
+    assert "OFFSCREEN RIGHT" not in page.evaluate("viewportText(3000)")
+
+
+def test_relative_offscreen_left_element_is_not_in_viewport(load_page):
+    page = load_page(PLAIN_PAGE)
+    page.evaluate("""
+        const d = document.createElement('div');
+        d.id = 'farleft';
+        d.textContent = 'FAR LEFT';
+        d.style.position = 'absolute';
+        d.style.left = '-9999px';
+        d.style.top = '50px';
+        document.body.appendChild(d);
+    """)
+
+    assert page.evaluate("inViewport(document.getElementById('farleft'))") is False
+
+
+def _long_page(paragraphs=400):
+    body = "\n".join(
+        f"<p>Paragraph {i} explains recursion and iteration in some detail.</p>"
+        for i in range(paragraphs)
+    )
+    return (
+        "<html><head><title>Long lesson</title></head><body>"
+        f"<main><h1>Recursion</h1>{body}</main></body></html>"
+    )
+
+
+def test_mcq_explain_without_options_sends_full_page_text(load_page, stub_api):
+    page = load_page(_long_page())
+    calls = stub_api(page)
+    page.evaluate("doAction('mcq-explain')")
+
+    body = calls[0]["body"]
+    assert "options" not in body
+    # far beyond the 4000-char viewport budget, up to the 60000 cap
+    assert len(body["context"]) > 4000
+    assert "Paragraph 399" in body["context"]
+
+
+def test_explain_still_uses_the_short_viewport_budget(load_page, stub_api):
+    page = load_page(_long_page())
+    calls = stub_api(page)
+    page.evaluate("doAction('explain')")
+
+    assert len(calls[0]["body"]["context"]) <= 4000
+
+
+
 

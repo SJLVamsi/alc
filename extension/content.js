@@ -1,12 +1,18 @@
 const API_BASE = 'http://localhost:8000';
 
-// --- capture limits (Spec A) ---
+// --- capture limits (Spec A / patch 2) ---
 const MAX_QUESTION_CHARS = 2000;
 const MAX_CONTEXT_CHARS = 4000;
 const MAX_VISIBLE_CHARS = 3000;
 const MAX_PAGE_CHARS = 12000;
+// Full cleaned page text for mcq-explain when no options were detected.
+// Must match EXTENSION_MAX_CONTEXT in backend/app/api/routes/extension.py.
+const MAX_PAGE_CONTEXT_CHARS = 60000;
 const SELECTION_MIN_CHARS = 10;
 const SELECTION_TTL_MS = 2 * 60 * 1000;
+const WATCH_DEBOUNCE_MS = 1500;
+// A constantly-mutating page must not postpone the check forever.
+const WATCH_MAX_DELAY_MS = 4000;
 
 const SKIP_SELECTOR = 'nav, header, footer, aside, [role="navigation"], [role="banner"]';
 const SKIP_TAGS = new Set(['SCRIPT', 'STYLE', 'NOSCRIPT', 'TEMPLATE', 'NAV', 'HEADER', 'FOOTER', 'ASIDE']);
@@ -153,28 +159,108 @@ function cssEscape(value) {
   return String(value).replace(/([^\w-])/g, '\\$1');
 }
 
+// --- capture: rendered text ----------------------------------------------
+
+// An element the browser actually lays out: not inside the widget, not page
+// chrome, not display:none / visibility:hidden anywhere up the chain.
+function isRendered(el) {
+  if (!el || el.nodeType !== 1) return false;
+  if (SKIP_TAGS.has(el.tagName)) return false;
+  if (isInWidget(el)) return false;
+  if (el.closest && el.closest(SKIP_SELECTOR)) return false;
+  if (!el.getClientRects().length) return false;
+  const style = window.getComputedStyle(el);
+  return style.display !== 'none' && style.visibility !== 'hidden';
+}
+
+// Walk the LIVE dom collecting text from rendered nodes only. A detached
+// clone cannot do this: its innerText falls back to textContent, which drags
+// display:none content (hidden answers, widget text) into the prompt.
+function collectText(root, { limit = 0, accept } = {}) {
+  if (!root) return '';
+  const parts = [];
+  let total = 0;
+  const cache = new Map();
+
+  const usable = (el) => {
+    if (cache.has(el)) return cache.get(el);
+    let ok = isRendered(el);
+    if (ok && accept) ok = accept(el);
+    cache.set(el, ok);
+    return ok;
+  };
+
+  const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
+    acceptNode(node) {
+      const parent = node.parentElement;
+      if (!parent || !usable(parent)) return NodeFilter.FILTER_REJECT;
+      return (node.nodeValue || '').trim() ? NodeFilter.FILTER_ACCEPT : NodeFilter.FILTER_REJECT;
+    },
+  });
+
+  let node;
+  while ((node = walker.nextNode())) {
+    const text = (node.nodeValue || '').trim();
+    if (!text) continue;
+    parts.push(text);
+    total += text.length + 1;
+    if (limit && total >= limit) break;
+  }
+  return parts.join(' ');
+}
+
+function renderedText(root, limit = 0) {
+  return collectText(root, { limit });
+}
+
+function inViewport(el) {
+  const rect = el.getBoundingClientRect();
+  if (rect.width <= 0 || rect.height <= 0) return false;
+  return rect.bottom > 0 && rect.top < window.innerHeight
+    && rect.right > 0 && rect.left < window.innerWidth;
+}
+
 // --- capture: selection --------------------------------------------------
 
-function rememberSelection() {
-  let sel = '';
+function selectionRange() {
   try {
-    sel = (window.getSelection() || '').toString().trim();
+    const sel = window.getSelection();
+    if (!sel || !sel.rangeCount) return null;
+    return sel.getRangeAt(0);
   } catch (e) {
-    sel = '';
+    return null;
   }
-  if (sel) lastSelection = { text: sel, ts: Date.now() };
+}
+
+// A selection that touches the widget is our own UI text, not page content.
+function selectionTouchesWidget(range) {
+  if (!range) return false;
+  const widget = document.getElementById('alc-widget');
+  if (!widget) return false;
+  try {
+    if (typeof range.intersectsNode === 'function' && range.intersectsNode(widget)) return true;
+  } catch (e) { /* ignore */ }
+  return isInWidget(range.commonAncestorContainer)
+    || isInWidget(range.startContainer)
+    || isInWidget(range.endContainer);
+}
+
+function rememberSelection() {
+  const range = selectionRange();
+  if (!range) return;
+  const text = String(range).trim();
+  if (!text || selectionTouchesWidget(range)) return;
+  lastSelection = { text, ts: Date.now() };
 }
 
 function currentSelection() {
-  let sel = '';
-  try {
-    sel = (window.getSelection() || '').toString().trim();
-  } catch (e) {
-    sel = '';
+  const range = selectionRange();
+  if (range && !selectionTouchesWidget(range)) {
+    const text = String(range).trim();
+    if (text.length >= SELECTION_MIN_CHARS) return text;
   }
-  if (sel.length >= SELECTION_MIN_CHARS) return sel;
   // Button clicks steal focus and collapse the selection, so fall back to the
-  // most recent non-empty selection if it's still fresh.
+  // most recent non-widget selection if it's still fresh.
   if (Date.now() - lastSelection.ts < SELECTION_TTL_MS) return lastSelection.text;
   return '';
 }
@@ -184,8 +270,11 @@ function currentSelection() {
 function collectOptionGroups(root) {
   const groups = [];
 
+  const usable = (el) => !isInWidget(el);
+
   const byName = new Map();
   root.querySelectorAll('input[type="radio"], input[type="checkbox"]').forEach(el => {
+    if (!usable(el)) return;
     const name = el.getAttribute('name');
     if (!name) return;
     const key = `${el.type}|${name}`;
@@ -195,17 +284,19 @@ function collectOptionGroups(root) {
   byName.forEach(els => { if (els.length >= 2) groups.push(els); });
 
   root.querySelectorAll('[role="radiogroup"]').forEach(rg => {
-    const opts = Array.from(rg.querySelectorAll('[role="radio"]'));
+    if (!usable(rg)) return;
+    const opts = Array.from(rg.querySelectorAll('[role="radio"]')).filter(usable);
     if (opts.length >= 2) groups.push(opts);
   });
 
   root.querySelectorAll('[class]').forEach(el => {
+    if (!usable(el)) return;
     const cls = (el.className || '').toString();
     if (!/option|choice|answer/i.test(cls)) return;
     const parent = el.parentElement;
-    if (!parent) return;
+    if (!parent || isInWidget(parent)) return;
     const siblings = Array.from(parent.children).filter(s =>
-      /option|choice|answer/i.test((s.className || '').toString())
+      usable(s) && /option|choice|answer/i.test((s.className || '').toString())
     );
     if (siblings.length >= 2 && siblings.length <= 6) groups.push(siblings);
   });
@@ -223,9 +314,39 @@ function collectOptionGroups(root) {
   });
 }
 
+// Custom-styled radios usually hide the <input> and paint a wrapper label, so
+// visibility, distance and text all come from the visible wrapper. Grouping
+// still uses the native input identity.
+function optionDisplayElement(el) {
+  if (!el) return null;
+  if (el.tagName === 'INPUT') {
+    if (el.id) {
+      const lbl = document.querySelector(`label[for="${cssEscape(el.id)}"]`);
+      if (lbl) return lbl;
+    }
+    const wrap = el.closest('label');
+    if (wrap) return wrap;
+    return el.parentElement || el;
+  }
+  return el;
+}
+
+// Only options whose visible wrapper is actually rendered, so display:none
+// text is never used just because an ancestor happens to have a box.
+function renderedOptions(els) {
+  return els.filter(el => {
+    const display = optionDisplayElement(el);
+    return !!display && isRendered(display);
+  });
+}
+
 function groupVisibility(els) {
-  const rects = els.map(e => e.getBoundingClientRect());
-  const onscreen = rects.filter(r => r.width > 0 && r.height > 0 && r.bottom > 0 && r.top < window.innerHeight);
+  const rects = els.map(el => (optionDisplayElement(el) || el).getBoundingClientRect());
+  const onscreen = rects.filter(r =>
+    r.width > 0 && r.height > 0 &&
+    r.bottom > 0 && r.top < window.innerHeight &&
+    r.right > 0 && r.left < window.innerWidth
+  );
   if (!onscreen.length) return null;
   const centre = onscreen.reduce((a, r) => a + r.top + r.height / 2, 0) / onscreen.length;
   return {
@@ -239,8 +360,8 @@ function textBlockBefore(node, boundary) {
   while (cur && cur !== boundary) {
     let sib = cur.previousElementSibling;
     while (sib) {
-      const text = (sib.innerText || sib.textContent || '').trim();
-      if (text && !isInWidget(sib)) return text;
+      const text = renderedText(sib, 0);
+      if (text) return text;
       sib = sib.previousElementSibling;
     }
     cur = cur.parentElement;
@@ -249,23 +370,9 @@ function textBlockBefore(node, boundary) {
 }
 
 function optionTextFor(el) {
-  let text = '';
-  if (el.tagName === 'INPUT') {
-    if (el.id) {
-      const lbl = document.querySelector(`label[for="${cssEscape(el.id)}"]`);
-      if (lbl) text = lbl.innerText || lbl.textContent || '';
-    }
-    if (!text) {
-      const wrap = el.closest('label');
-      if (wrap) text = wrap.innerText || wrap.textContent || '';
-    }
-    if (!text && el.parentElement) {
-      text = el.parentElement.innerText || el.parentElement.textContent || '';
-    }
-  } else {
-    text = el.innerText || el.textContent || '';
-  }
-  return stripOptionMarker(text);
+  const display = optionDisplayElement(el);
+  if (!display) return '';
+  return stripOptionMarker(renderedText(display, 0));
 }
 
 function detectMCQGroup() {
@@ -273,10 +380,12 @@ function detectMCQGroup() {
   let best = null;
 
   for (const els of groups) {
-    const vis = groupVisibility(els);
+    const shown = renderedOptions(els);
+    if (shown.length < 2) continue;
+    const vis = groupVisibility(shown);
     if (!vis) continue;
     const score = (vis.fullyVisible ? 0 : 1e6) + vis.distance;
-    if (!best || score < best.score) best = { els, score };
+    if (!best || score < best.score) best = { els: shown, score };
   }
   if (!best) return null;
 
@@ -293,16 +402,18 @@ function detectMCQGroup() {
     if (before) { container = cur; stem = before; break; }
     if (container === null) container = cur; // fallback: group-only ancestor
   }
-  if (!container) return null;
+  if (!container || isInWidget(container)) return null;
 
   const options = best.els.map(optionTextFor).filter(t => t.length > 0);
   if (options.length < 2) return null;
 
-  const inViewport = best.els[0].getBoundingClientRect();
-  if (inViewport.top > window.innerHeight || inViewport.bottom < 0) return null;
+  const firstDisplay = optionDisplayElement(best.els[0]) || best.els[0];
+  if (!inViewport(firstDisplay)) return null;
 
   return {
-    questionText: (container.innerText || container.textContent || stem).trim(),
+    // Clean the ancestor: its raw innerText could include hidden nodes or
+    // widget text if the widget ever ends up nested inside it.
+    questionText: renderedText(container, 0),
     stem,
     options,
   };
@@ -311,51 +422,32 @@ function detectMCQGroup() {
 // --- capture: visible text -----------------------------------------------
 
 function viewportText(limit = MAX_VISIBLE_CHARS) {
-  const parts = [];
-  let total = 0;
-  const walker = document.createTreeWalker(document.body || document.documentElement, NodeFilter.SHOW_TEXT, {
-    acceptNode(node) {
-      const parent = node.parentElement;
-      if (!parent) return NodeFilter.FILTER_REJECT;
-      if (SKIP_TAGS.has(parent.tagName)) return NodeFilter.FILTER_REJECT;
-      if (isInWidget(parent)) return NodeFilter.FILTER_REJECT;
-      if (parent.closest(SKIP_SELECTOR)) return NodeFilter.FILTER_REJECT;
-      const text = (node.nodeValue || '').trim();
-      if (!text) return NodeFilter.FILTER_REJECT;
-      const rect = parent.getBoundingClientRect();
-      if (!rect.width || !rect.height) return NodeFilter.FILTER_REJECT;
-      if (rect.bottom < 0 || rect.top > window.innerHeight) return NodeFilter.FILTER_REJECT;
-      return NodeFilter.FILTER_ACCEPT;
-    },
+  return collectText(document.body || document.documentElement, {
+    limit,
+    accept: inViewport,
   });
-
-  let node;
-  while ((node = walker.nextNode())) {
-    const text = (node.nodeValue || '').trim();
-    if (!text) continue;
-    parts.push(text);
-    total += text.length + 1;
-    if (total >= limit) break;
-  }
-  return parts.join(' ').slice(0, limit);
 }
 
 function nearestHeading() {
   const headings = Array.from(document.querySelectorAll('h1, h2, h3'));
-  let best = '';
-  for (const h of headings) {
-    const rect = h.getBoundingClientRect();
-    if (rect.bottom <= 0 || isInWidget(h)) continue;
-    const text = (h.innerText || h.textContent || '').trim();
-    if (text) { best = text; break; }
+  for (const heading of headings) {
+    if (isInWidget(heading)) continue;
+    if (heading.getBoundingClientRect().bottom <= 0) continue;
+    const text = renderedText(heading, 200);
+    if (text) return text;
   }
-  return best;
+  return '';
 }
 
-function getQuestionContext() {
+function fullPageContext() {
+  return getPageText(MAX_PAGE_CONTEXT_CHARS).slice(0, MAX_PAGE_CONTEXT_CHARS);
+}
+
+async function getQuestionContext(action = '') {
   const title = document.title;
   const url = location.href;
   const selection = currentSelection();
+  const wantsMcq = action === 'mcq-explain';
 
   if (selection) {
     return {
@@ -363,7 +455,7 @@ function getQuestionContext() {
       label: 'selection',
       question_text: selection.slice(0, MAX_QUESTION_CHARS),
       options: [],
-      context_text: viewportText(MAX_CONTEXT_CHARS),
+      context_text: wantsMcq ? fullPageContext() : viewportText(MAX_CONTEXT_CHARS),
       page_title: title,
       url,
     };
@@ -377,6 +469,21 @@ function getQuestionContext() {
       question_text: mcq.questionText.slice(0, MAX_QUESTION_CHARS),
       options: mcq.options,
       context_text: mcq.questionText.slice(0, MAX_CONTEXT_CHARS),
+      page_title: title,
+      url,
+    };
+  }
+
+  if (wantsMcq) {
+    // No options anywhere: hand the backend the whole cleaned page and let the
+    // explainer cut its own region.
+    const page = fullPageContext();
+    return {
+      source: 'page',
+      label: 'full page text',
+      question_text: page.slice(0, MAX_QUESTION_CHARS),
+      options: [],
+      context_text: page,
       page_title: title,
       url,
     };
@@ -396,31 +503,17 @@ function getQuestionContext() {
   };
 }
 
-function getPageText() {
+function getPageText(limit = 0) {
   const root = document.querySelector('main') || document.querySelector('#root') || document.body;
   if (!root) return '';
 
-  let text = '';
-  let clone = null;
-  try { clone = root.cloneNode(true); } catch (e) { clone = null; }
-
-  if (clone) {
-    clone.querySelectorAll('#alc-widget').forEach(el => el.remove());
-    clone.querySelectorAll('script, style, noscript, template, nav, footer, aside, [role="navigation"], [role="banner"]')
-      .forEach(el => el.remove());
-    text = (clone.innerText || clone.textContent || '').trim();
-  } else {
-    text = (root.innerText || '').trim();
-  }
-
-  const parts = [text];
-  document.querySelectorAll('iframe').forEach(f => {
+  const parts = [renderedText(root, limit)];
+  document.querySelectorAll('iframe').forEach(frame => {
     try {
-      const doc = f.contentDocument;
-      if (doc && doc.body) {
-        const t = (doc.body.innerText || '').trim();
-        if (t) parts.push(t);
-      }
+      const doc = frame.contentDocument;
+      if (!doc || !doc.body) return;
+      const frameText = renderedText(doc.body, limit);
+      if (frameText) parts.push(frameText);
     } catch (e) { /* cross-origin, ignore */ }
   });
   return parts.filter(Boolean).join('\n');
@@ -450,16 +543,19 @@ function collectCodeInDoc(doc) {
   };
 
   doc.querySelectorAll('pre').forEach((pre, i) => {
+    if (isInWidget(pre)) return;
     const codeEl = pre.querySelector('code');
     add(pre.innerText, codeEl ? guessLanguage(codeEl) : '', i * 100);
   });
 
   doc.querySelectorAll('code').forEach((el, i) => {
+    if (isInWidget(el)) return;
     if (el.closest('pre')) return;
     add(el.innerText, guessLanguage(el), 1000 + i * 100);
   });
 
   doc.querySelectorAll('.view-lines, .cm-content, .ace_content, .cm-editor').forEach((el, i) => {
+    if (isInWidget(el)) return;
     const lineEls = el.querySelectorAll('.view-line, .cm-line, .ace_line');
     const lines = [];
     lineEls.forEach((lineEl, j) => {
@@ -471,6 +567,7 @@ function collectCodeInDoc(doc) {
   });
 
   doc.querySelectorAll('textarea').forEach((el, i) => {
+    if (isInWidget(el)) return;
     if (el.value && el.value.length > 20) add(el.value, '', 3000 + i * 100);
   });
 
@@ -480,6 +577,7 @@ function collectCodeInDoc(doc) {
 function getCodeBlocks() {
   let blocks = collectCodeInDoc(document);
   document.querySelectorAll('iframe').forEach(f => {
+    if (isInWidget(f)) return;
     try {
       blocks = blocks.concat(collectCodeInDoc(f.contentDocument));
     } catch (e) { /* cross-origin, ignore */ }
@@ -764,14 +862,14 @@ function captureBannerHtml(ctx, forceExpanded) {
   return html;
 }
 
-function showCapturePreview() {
-  const ctx = getQuestionContext();
+async function showCapturePreview() {
+  const ctx = await getQuestionContext();
   lastCapture = ctx;
   showResult(captureBannerHtml(ctx, true));
 }
 
 async function doAction(action) {
-  const ctx = getQuestionContext();
+  const ctx = await getQuestionContext(action);
   lastCapture = ctx;
   // Code blocks are only useful for coding help; sending them with an MCQ or
   // an explanation just burns context and confuses the model.

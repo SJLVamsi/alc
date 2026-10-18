@@ -719,7 +719,9 @@ async function doAction(action) {
   const sel = window.getSelection().toString().trim();
   const text = sel || getPageText();
   const title = document.title;
-  const codeContext = getCodeBlocks();
+  // Code blocks are only useful for coding help; sending them with an MCQ or
+  // an explanation just burns context and confuses the model.
+  const codeContext = action === 'coding-help' ? getCodeBlocks() : '';
 
   showLoading();
 
@@ -814,9 +816,9 @@ async function sendChatMessage() {
 
   chatHistory.push({ role: "user", content: text });
 
-  const pageContext = getPageText().slice(0, 12000);
-  const codeContext = getCodeBlocks();
+  const pageContext = getPageText().slice(0, MAX_PAGE_CHARS);
   const codeIntent = /\b(code|write|implement|solve|solution|function|program|snippet|fix|syntax)\b/i.test(text);
+  const codeContext = codeIntent ? getCodeBlocks() : '';
 
   try {
     const res = await fetch(`${API_BASE}/api/extension/ask`, {

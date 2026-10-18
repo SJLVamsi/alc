@@ -522,5 +522,154 @@ def test_explain_still_uses_the_short_viewport_budget(load_page, stub_api):
     assert len(calls[0]["body"]["context"]) <= 4000
 
 
+# --- patch 2: watcher correctness ----------------------------------------
+
+def _select_para(page, selector="#para"):
+    page.evaluate(
+        """sel => {
+            const range = document.createRange();
+            range.selectNodeContents(document.querySelector(sel));
+            const s = window.getSelection();
+            s.removeAllRanges();
+            s.addRange(range);
+            document.dispatchEvent(new Event('mouseup'));
+        }""",
+        selector,
+    )
+
+
+def test_fingerprint_ignores_selection(load_page):
+    page = load_page(MCQ_PAGE)
+    before = page.evaluate("questionFingerprint()")
+    _select_para(page, ".stem")
+    after = page.evaluate("questionFingerprint()")
+
+    assert before.startswith("mcq:")
+    assert before == after
+
+
+def test_chat_survives_selection_change_and_expiry(load_page):
+    page = load_page(PLAIN_PAGE)
+    page.evaluate("""
+        chatHistory = [{role: 'user', content: 'keep me'}];
+        lastUrl = location.href;
+        lastQuestionSignature = questionFingerprint();
+    """)
+
+    _select_para(page)
+    page.evaluate("checkPage()")
+    assert page.evaluate("chatHistory.length") == 1
+
+    # selection ages out
+    page.evaluate("lastSelection.ts = 0; checkPage()")
+    assert page.evaluate("chatHistory.length") == 1
+    assert page.evaluate("document.querySelectorAll('.alc-chat-notice').length") == 0
+
+
+def test_old_selection_does_not_cross_urls(load_page):
+    page = load_page(PLAIN_PAGE)
+    _select_para(page)
+    page.evaluate("window.getSelection().removeAllRanges()")
+    assert page.evaluate("currentSelection()") != ""
+
+    page.evaluate("lastUrl = 'https://example.com/elsewhere'; checkPage()")
+
+    assert page.evaluate("currentSelection()") == ""
+    assert page.evaluate("lastSelection.text") == ""
+
+
+def test_existing_mcq_does_not_reset_on_first_ordinary_mutation(load_page):
+    page = load_page(MCQ_PAGE)
+    # the watcher seeded the signature when it started
+    assert page.evaluate("lastQuestionSignature").startswith("mcq:")
+
+    page.evaluate("chatHistory = [{role: 'user', content: 'keep me'}]")
+    page.evaluate("checkPage()")
+
+    assert page.evaluate("chatHistory.length") == 1
+    assert page.evaluate("document.querySelectorAll('.alc-chat-notice').length") == 0
+
+
+def test_question_change_while_typing_is_deferred_not_lost(load_page):
+    page = load_page(MCQ_PAGE)
+    typing = page.evaluate("""() => {
+        chatHistory = [{role: 'user', content: 'keep me'}];
+        lastUrl = location.href;
+        lastQuestionSignature = 'stale-signature';
+        document.getElementById('alc-panel').classList.add('open');
+        switchTab('chat');
+        const input = document.getElementById('alc-chat-input');
+        input.focus();
+        input.value = 'half typed';
+        return document.activeElement === input;
+    }""")
+    if not typing:
+        pytest.skip("could not focus the chat input in this environment")
+
+    page.evaluate("checkPage()")
+
+    # deferred: the transition is still pending, nothing was thrown away
+    assert page.evaluate("chatHistory.length") == 1
+    assert page.evaluate("lastQuestionSignature") == "stale-signature"
+
+    page.evaluate("""
+        const input = document.getElementById('alc-chat-input');
+        input.value = '';
+        input.blur();
+    """)
+    page.evaluate("checkPage()")
+
+    assert page.evaluate("chatHistory.length") == 0
+    assert "New question detected" in page.inner_text(".alc-chat-notice")
+
+
+def test_watch_deadline_forces_a_check_despite_mutation_churn(load_page):
+    page = load_page(MCQ_PAGE)
+    page.evaluate("""
+        chatHistory = [{role: 'user', content: 'stale'}];
+        lastUrl = location.href;
+        lastQuestionSignature = 'stale-signature';
+        mutationTimer = null;
+        watchFirstMutationAt = Date.now() - 10000;
+    """)
+    page.evaluate("scheduleCheck()")
+
+    # past the max delay it runs at once instead of parking on another timer
+    assert page.evaluate("mutationTimer") is None
+    assert page.evaluate("watchFirstMutationAt") == 0
+    assert page.evaluate("chatHistory.length") == 0
+
+
+def test_fresh_mutation_schedules_a_debounced_check(load_page):
+    page = load_page(PLAIN_PAGE)
+    page.evaluate("mutationTimer = null; watchFirstMutationAt = 0;")
+    page.evaluate("scheduleCheck()")
+    assert page.evaluate("mutationTimer !== null") is True
+
+    page.evaluate("clearTimeout(mutationTimer); mutationTimer = null; watchFirstMutationAt = 0;")
+
+
+def test_widget_mutations_do_not_schedule_a_check(load_page):
+    page = load_page(PLAIN_PAGE)
+    page.evaluate("mutationTimer = null; watchFirstMutationAt = 0;")
+    page.evaluate("""
+        const widget = document.getElementById('alc-widget');
+        widget.setAttribute('data-twitch', Date.now());
+        widget.appendChild(document.createElement('span'));
+    """)
+    assert page.evaluate("mutationTimer") is None
+
+
+def test_mcq_explain_without_options_prefers_full_page_over_viewport(load_page, stub_api):
+    page = load_page(_long_page(120))
+    calls = stub_api(page)
+    page.evaluate("doAction('mcq-explain')")
+
+    body = calls[0]["body"]
+    assert "options" not in body
+    assert "Paragraph 119" in body["context"]
+
+
+
 
 

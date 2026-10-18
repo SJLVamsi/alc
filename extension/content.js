@@ -86,6 +86,7 @@ let lastSelection = { text: '', ts: 0 };
 let lastQuestionSignature = '';
 let previewCapture = false;
 let lastCapture = null;
+let watchFirstMutationAt = 0;
 
 function injectWidget() {
   if (document.getElementById('alc-widget')) return;
@@ -604,19 +605,41 @@ function hashString(text) {
   return String(hash);
 }
 
-// Cheap fingerprint of whatever the panel would currently act on: the live
-// selection, else the detected MCQ. Deliberately avoids the viewport walk so
-// it stays affordable on every debounced mutation.
+// Identity of the question being asked, from the detected stem+options only.
+// Selection state is deliberately excluded: chat history must survive the
+// user selecting, deselecting or letting a selection expire.
 function questionFingerprint() {
-  const sel = currentSelection();
-  if (sel) return `sel:${hashString(sel)}`;
   const mcq = detectMCQGroup();
-  if (mcq) return `mcq:${hashString(mcq.questionText)}`;
-  return '';
+  if (!mcq) return '';
+  return `mcq:${hashString(`${mcq.questionText}|${mcq.options.join('|')}`)}`;
 }
 
 function isWidgetMutation(mutation) {
   return isInWidget(mutation.target);
+}
+
+// Bounded debounce: each mutation pushes the check out, but never past
+// WATCH_MAX_DELAY_MS from the first one, so a page that mutates continuously
+// still gets checked instead of postponing forever.
+function scheduleCheck() {
+  const now = Date.now();
+  if (!watchFirstMutationAt) watchFirstMutationAt = now;
+
+  const elapsed = now - watchFirstMutationAt;
+  if (elapsed >= WATCH_MAX_DELAY_MS) {
+    if (mutationTimer) { clearTimeout(mutationTimer); mutationTimer = null; }
+    watchFirstMutationAt = 0;
+    checkPage();
+    return;
+  }
+
+  if (mutationTimer) clearTimeout(mutationTimer);
+  const wait = Math.min(WATCH_DEBOUNCE_MS, WATCH_MAX_DELAY_MS - elapsed);
+  mutationTimer = setTimeout(() => {
+    mutationTimer = null;
+    watchFirstMutationAt = 0;
+    checkPage();
+  }, wait);
 }
 
 function startPageWatcher() {
@@ -631,12 +654,12 @@ function startPageWatcher() {
   new MutationObserver((mutations) => {
     // The widget animates and re-renders constantly; never let it trigger us.
     if (mutations.length && mutations.every(isWidgetMutation)) return;
-    if (mutationTimer) clearTimeout(mutationTimer);
-    mutationTimer = setTimeout(() => {
-      mutationTimer = null;
-      checkPage();
-    }, 1500);
+    scheduleCheck();
   }).observe(document.body, { childList: true, subtree: true, characterData: true });
+
+  // Seed the signature so the question already on screen is not reported as a
+  // change by the first ordinary mutation.
+  lastQuestionSignature = questionFingerprint();
 }
 
 function showChatNotice(text) {
@@ -652,22 +675,30 @@ function showChatNotice(text) {
 
 function checkPage() {
   const urlChanged = location.href !== lastUrl;
-  if (urlChanged) lastUrl = location.href;
-
   const fingerprint = questionFingerprint();
   const questionChanged = !!fingerprint && fingerprint !== lastQuestionSignature;
-  if (questionChanged) lastQuestionSignature = fingerprint;
 
   // Ordinary page churn is not a reason to throw away the conversation.
   if (!urlChanged && !questionChanged) return;
 
+  // Defer while the user is typing, and critically: do NOT consume the
+  // transition. lastUrl/lastQuestionSignature stay put so the change is still
+  // pending and gets handled by the next check.
   const input = document.getElementById('alc-chat-input');
   if (input && document.activeElement === input && input.value.trim()) return;
 
+  if (urlChanged) {
+    lastUrl = location.href;
+    // A selection from the previous page must not follow us across.
+    lastSelection = { text: '', ts: 0 };
+    lastQuestionSignature = fingerprint;
+  } else if (questionChanged) {
+    lastQuestionSignature = fingerprint;
+  }
+
   chatHistory = [];
   chatInitialized = false;
-  const chatInput = document.getElementById('alc-chat-input');
-  if (chatInput) chatInput.value = '';
+  if (input) input.value = '';
 
   showChatNotice(
     urlChanged

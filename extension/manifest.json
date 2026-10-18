@@ -1,0 +1,32 @@
+{
+  "manifest_version": 3,
+  "name": "ALC - AI Learning Copilot",
+  "version": "1.7.0",
+  "description": "AI-powered learning assistant that helps you understand concepts on any website.",
+  "permissions": ["storage", "activeTab"],
+  "host_permissions": ["<all_urls>", "http://localhost:8000/*"],
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["content.js"],
+      "css": ["styles.css"],
+      "run_at": "document_idle",
+      "exclude_matches": [
+        "https://chrome.google.com/*",
+        "https://accounts.google.com/*"
+      ]
+    }
+  ],
+  "action": {
+    "default_title": "ALC Copilot",
+    "default_icon": {
+      "16": "icon16.svg",
+      "48": "icon48.svg"
+    }
+  },
+  "icons": {
+    "16": "icon16.svg",
+    "48": "icon48.svg",
+    "128": "icon128.svg"
+  }
+}

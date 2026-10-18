@@ -131,9 +131,12 @@ def test_falls_back_to_visible_text(load_page):
 
     assert ctx["source"] == "visible"
     assert ctx["label"] == "visible text"
-    assert "Recursion is when a function calls itself" in ctx["question_text"]
-    assert "Site navigation" not in ctx["question_text"]
-    assert "Footer junk" not in ctx["question_text"]
+    # question_text is deliberately empty: the backend finds the real stem and
+    # a page-head slice here would override it.
+    assert ctx["question_text"] == ""
+    assert "Recursion is when a function calls itself" in ctx["context_text"]
+    assert "Site navigation" not in ctx["context_text"]
+    assert "Footer junk" not in ctx["context_text"]
 
 
 def test_get_page_text_excludes_widget_and_chrome(load_page):
@@ -668,6 +671,50 @@ def test_mcq_explain_without_options_prefers_full_page_over_viewport(load_page, 
     body = calls[0]["body"]
     assert "options" not in body
     assert "Paragraph 119" in body["context"]
+
+
+def test_page_fallback_sends_empty_question_text(load_page, stub_api):
+    """The page head must not be sent as question_text.
+
+    The backend prefers a supplied question_text over its own regex stem, so
+    sending the page head would explain the right options against the wrong
+    question.
+    """
+    page = load_page(_long_page(120))
+    calls = stub_api(page)
+    page.evaluate("doAction('mcq-explain')")
+
+    assert calls[0]["body"]["text"] == ""
+
+
+def test_visible_fallback_sends_empty_question_text(load_page, stub_api):
+    page = load_page(PLAIN_PAGE)
+    calls = stub_api(page)
+    page.evaluate("doAction('explain')")
+
+    assert calls[0]["body"]["text"] == ""
+
+
+def test_selection_branch_still_sends_the_selection(load_page, stub_api):
+    page = load_page(PLAIN_PAGE)
+    _select_para(page)
+    calls = stub_api(page)
+    page.evaluate("doAction('explain')")
+
+    body = calls[0]["body"]
+    assert "calls itself" in body["text"]
+    assert body["context"]
+
+
+def test_mcq_branch_still_sends_the_question(load_page, stub_api):
+    page = load_page(MCQ_PAGE)
+    calls = stub_api(page)
+    page.evaluate("doAction('mcq-explain')")
+
+    body = calls[0]["body"]
+    assert "FIFO" in body["text"]
+    assert body["options"] == ["Stack", "Queue", "Tree"]
+
 
 
 # --- patch 2: iframe bridge ----------------------------------------------

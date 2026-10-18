@@ -583,12 +583,15 @@ async function getQuestionContext(action = '') {
 
   if (wantsMcq) {
     // No options anywhere: hand the backend the whole cleaned page and let the
-    // explainer cut its own region.
+    // explainer cut its own region. question_text stays empty on purpose - the
+    // backend prefers a supplied question_text over its regex-found stem, so
+    // sending the page head here would explain the right options against the
+    // wrong question.
     const page = fullPageContext();
     return {
       source: 'page',
       label: 'full page text',
-      question_text: page.slice(0, MAX_QUESTION_CHARS),
+      question_text: '',
       options: [],
       context_text: page,
       page_title: title,
@@ -602,7 +605,8 @@ async function getQuestionContext(action = '') {
   return {
     source: 'visible',
     label: 'visible text',
-    question_text: visible.slice(0, MAX_QUESTION_CHARS),
+    // Empty for the same reason: let the backend find the real stem.
+    question_text: '',
     options: [],
     context_text: context.slice(0, MAX_CONTEXT_CHARS),
     page_title: title,

@@ -245,6 +245,36 @@ def test_extension_explain_uses_context_when_text_missing(client):
     assert "Context-only explanation source." in mock_gen.call_args.args[0]
 
 
+def test_extension_mcq_regex_stem_not_the_page_head(client):
+    """A long page must be explained against its real question.
+
+    The extension sends question_text="" for the page fallback, so the
+    explainer's regex stem is what reaches the model - not the first 2000
+    characters of the page.
+    """
+    filler = "\n".join(
+        f"Paragraph {i} is filler text about unrelated things." for i in range(400)
+    )
+    page = f"{filler}\nWhich data structure is FIFO?\nA. Stack\nB. Queue\n"
+
+    with patch(
+        "app.api.routes.extension.mcq_explainer.explain_question",
+        return_value={"options": [], "suggested_answer": "B", "overall_reasoning": "r"},
+    ) as mock_explain:
+        resp = client.post("/api/extension/ask", json={
+            "action": "mcq-explain",
+            "text": "",
+            "context": page,
+        })
+
+    assert resp.status_code == 200
+    stem = mock_explain.call_args.args[0]
+    assert "FIFO" in stem
+    assert "Paragraph 0 is filler" not in stem
+    assert len(stem) <= 1200
+    assert [o["text"] for o in mock_explain.call_args.args[1]] == ["Stack", "Queue"]
+
+
 def test_extension_mcq_extracts_options_via_model_when_page_gives_none(client):
     """Only the bounded captured region is sent, not the first N page chars."""
     captured = {}
